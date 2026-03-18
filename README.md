@@ -2,7 +2,7 @@
 
 这是一个基于 Python 和 Google Gemini API 开发的现代化桌面小工具。它可以自动下载 B 站视频的音频，或读取本地音视频文件，利用大模型快速提取长视频的核心摘要和干货要点，帮你大幅节省观看“注水”视频的时间！
 
-<img width="1252" height="1039" alt="image" src="https://github.com/user-attachments/assets/bfbfa358-27cf-4c74-8a45-9c238b7474f1" />
+<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/bfbfa358-27cf-4c74-8a45-9c238b7474f1" />
 
 ## 🌟 核心功能
 
@@ -29,3 +29,25 @@
    ```bash
    git clone [https://github.com/你的用户名/你的仓库名.git](https://github.com/你的用户名/你的仓库名.git)
    cd 你的仓库名
+2. 安装所需的 Python 依赖库：
+   ```bash
+   pip install -r requirements.txt
+
+## 🚀 使用说明
+确保 ffmpeg.exe 已经放在了代码同级目录中（或已配置到系统环境变量）。
+
+运行主程序：   
+   ```bash
+   python main.py
+```
+
+
+## 首次运行： 软件会弹窗提示配置 Gemini API Key，输入后将自动保存在本地 ~/.bili_summarizer/api_key.txt 中。
+
+开始提取：
+
+方式一： 在顶部输入框粘贴 B 站视频网址，点击“开始提取”。
+
+方式二： 将 B 站客户端缓存的 .m4s 文件或其他音频文件拖入虚线框，点击“开始提取”。
+
+阅读完 AI 生成的 Markdown 笔记后，可点击右侧红色的“删除本地文件”按钮清理缓存。
