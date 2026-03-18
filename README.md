@@ -36,6 +36,8 @@
 ## 🚀 使用说明
 确保 ffmpeg.exe 已经放在了代码同级目录中（或已配置到系统环境变量）。
 
+下载 FFmpeg (Windows版)：[FFmpeg (Windows版)](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip&authuser=1)
+
 运行主程序：   
    ```bash
    python main.py
