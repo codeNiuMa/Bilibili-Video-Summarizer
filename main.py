@@ -9,6 +9,8 @@ import glob
 from google import genai
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import yt_dlp  # 🌟 新增：强大的音视频下载库
+import shutil  # 🌟 新增：用于文件复制和移动
+import customtkinter as ctk
 
 # ==========================================
 # 🔑 在这里填入你的 Gemini API Key
@@ -343,37 +345,60 @@ class VideoSummarizerApp:
 
             import uuid
             original_dir = os.path.dirname(os.path.abspath(process_file))
+            # 1. 创建唯一的临时文件名（用于上传），确保不与原文件冲突
             safe_filename = os.path.join(original_dir, f"temp_gemini_{uuid.uuid4().hex}.mp3")
-            os.rename(process_file, safe_filename)
+
+            self.update_ui_text("⏳ 正在为云端上传准备临时文件...\n")
+
+            # 🛠️ 核心修复（1）：复制用户文件，不再直接重命名原文件！
+            # 使用 copy2 可以尽量保留文件的元数据
+            shutil.copy2(process_file, safe_filename)
 
             try:
+                # 在这个主要的 try...finally 块内处理本地副本的创建和上传后的清理
                 self.update_ui_text("☁️ 正在上传音频至 AI 云端...\n")
                 audio_file = client.files.upload(file=safe_filename)
+                self.update_ui_text("🧠 上传成功！")
+
+                # --- 嵌套：使用前一个针对云端文件清理的 try...finally ---
+                try:
+                    self.update_ui_text("🧠 Gemini 正在分析总结，请稍候...\n")
+
+                    prompt = """
+                                请你仔细聆听这段音频，这是一个视频的配音。
+                                为了帮我节约时间，请你提供一个简短的、结构化的视频概要。
+                                请包含以下内容：
+                                1. 一句话总结视频核心主题。
+                                2. 按逻辑列出 3-5 个核心要点或干货（用 bullet points）。
+                                3. 过滤掉废话和片头片尾的寒暄.
+                                """
+
+                    response = client.models.generate_content(
+                        model=MODEL_NAME,
+                        contents=[prompt, audio_file]
+                    )
+
+                    self.update_ui_text(f"\n{'=' * 40}\n\n")
+                    self.render_markdown(response.text)
+                    self.update_ui_text(f"\n{'=' * 40}\n🎉 总结完毕！\n")
+
+                finally:
+                    # 🧹 针对云端文件的清理（整合上一个修复）
+                    # 无论 generate_content 成功还是报错，强制清理云端临时文件
+                    try:
+                        client.files.delete(name=audio_file.name)
+                        print(f"已清理云端临时文件: {audio_file.name}")  # 后台日志
+                    except Exception as delete_err:
+                        print(f"清理云端文件失败: {delete_err}")
+
             finally:
+                # 🧹 核心修复（2）：无论上传成功、总结成功还是报错，强制删除本地临时 copy 文件！
+                # 这样用户的原始文件（process_file）始终没有被修改或移动过，彻底根除“重命名失败”的风险。
                 if os.path.exists(safe_filename):
-                    os.rename(safe_filename, process_file)
+                    os.remove(safe_filename)
+                    print(f"已清理本地临时 copy 文件: {safe_filename}")
 
-            self.update_ui_text("🧠 上传成功！Gemini 正在分析总结，请稍候...\n")
-
-            prompt = """
-            请你仔细聆听这段音频，这是一个视频的配音。
-            为了帮我节约时间，请你提供一个简短的、结构化的视频概要。
-            请包含以下内容：
-            1. 一句话总结视频核心主题。
-            2. 按逻辑列出 3-5 个核心要点或干货（用 bullet points）。
-            3. 过滤掉废话和片头片尾的寒暄。
-            """
-
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[prompt, audio_file]
-            )
-
-            self.update_ui_text(f"\n{'=' * 40}\n\n")
-            self.render_markdown(response.text)
-            self.update_ui_text(f"\n{'=' * 40}\n🎉 总结完毕！\n")
-
-            client.files.delete(name=audio_file.name)
+            # 👆 修改结束 👆
 
         except Exception as e:
             error_msg = str(e)
