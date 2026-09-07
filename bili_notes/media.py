@@ -87,7 +87,14 @@ class Media:
                     info = ydl.extract_info(url, download=False)
                 except Exception as exc:
                     self.token.check()
-                    if not subtitles or is_bili_gate(exc):
+                    if subtitles and is_bili_gate(exc):
+                        self.progress(
+                            "字幕接口受限",
+                            9,
+                            "B 站拒绝字幕预解析，正在回退到旧版单次音频下载…",
+                        )
+                        return "B 站视频", None
+                    if not subtitles:
                         raise
                     self.progress("字幕提取失败", 8, "重试读取视频信息，并回退为音频处理。")
                     ydl.params.update({"writesubtitles": False, "writeautomaticsub": False})

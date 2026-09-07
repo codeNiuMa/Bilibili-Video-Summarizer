@@ -106,9 +106,9 @@ class Pipeline:
                         raise TaskError("字幕或文字文件为空，无法总结。")
                     input_kind = "本地字幕 / 文字"
                 elif not is_local:
-                    title, subtitle = media.resolve(
-                        source, directory, subtitles=request.mode == "auto"
-                    )
+                    subtitle = None
+                    if request.mode == "auto":
+                        title, subtitle = media.resolve(source, directory, subtitles=True)
                     if subtitle:
                         transcript, input_kind = subtitle, "视频字幕"
                     else:

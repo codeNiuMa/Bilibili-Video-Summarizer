@@ -30,11 +30,13 @@ class AI:
 class Media:
     subtitle = "[00:00:01] 从字幕提取的内容"
     downloaded = False
+    resolved = False
 
     def __init__(self, *args):
         pass
 
     def resolve(self, url, directory, subtitles=True):
+        type(self).resolved = True
         return "测试视频", self.subtitle if subtitles else None
 
     def download(self, url, directory):
@@ -57,6 +59,7 @@ def setup(tmp_path):
     AI.fail = False
     Media.subtitle = "[00:00:01] 从字幕提取的内容"
     Media.downloaded = False
+    Media.resolved = False
     store = Store(tmp_path / "data")
     token = CancelToken()
     pipeline = Pipeline(store, Settings(), token, lambda *args: None, AI, Media)
@@ -83,6 +86,13 @@ def test_audio_fallback_does_not_claim_to_be_transcript(setup):
     calls = AI.instances[-1].calls
     assert "00:08:00" in calls[1][0]
     assert len(calls) == 3
+
+
+def test_direct_audio_mode_skips_subtitle_preflight(setup):
+    pipeline, _, _ = setup
+    pipeline.run(Request("BV1xx411c7mD", "audio"), "fake")
+    assert Media.downloaded
+    assert not Media.resolved
 
 
 def test_local_transcription_and_failure_never_modify_original(setup, tmp_path):

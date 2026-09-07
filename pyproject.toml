@@ -7,7 +7,7 @@ name = "bili-notes"
 version = "2.0.0"
 description = "Bilibili audio and subtitle summarizer with a Qt desktop UI"
 requires-python = ">=3.11"
-dependencies = ["PySide6-Essentials==6.7.3", "google-genai>=2.22,<3", "yt-dlp>=2026.8.19", "keyring>=25.6,<26", "imageio-ffmpeg>=0.6,<0.7", "certifi>=2025.11.12"]
+dependencies = ["PySide6-Essentials==6.7.3", "google-genai>=2.22,<3", "yt-dlp==2026.3.17", "keyring>=25.6,<26", "imageio-ffmpeg>=0.6,<0.7", "certifi>=2025.11.12"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]

@@ -120,12 +120,14 @@ def test_subtitle_discovery_failure_retries_without_subtitle_flags(tmp_path, mon
     assert calls == [True, False]
 
 
-def test_bilibili_412_is_reported_without_repeated_requests(tmp_path, monkeypatch):
+def test_bilibili_412_during_subtitle_lookup_falls_back_to_audio(tmp_path, monkeypatch):
     import yt_dlp
 
     extract = Mock(side_effect=yt_dlp.utils.DownloadError("HTTP Error 412: Precondition Failed"))
     monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", extract)
     media = Media(Settings(), CancelToken(), lambda *args: None)
-    with pytest.raises(TaskError, match="HTTP 412"):
-        media.resolve("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path)
+    assert media.resolve("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path) == (
+        "B 站视频",
+        None,
+    )
     extract.assert_called_once()
