@@ -1,0 +1,7 @@
+# Direct dependency versions used by the Windows / Python 3.12 validation run.
+# Optional reproducibility constraints: pip install -r requirements.txt -c requirements-tested.txt
+PySide6-Essentials==6.11.2
+google-genai==2.22.0
+yt-dlp==2026.8.19
+keyring==25.7.0
+imageio-ffmpeg==0.6.0

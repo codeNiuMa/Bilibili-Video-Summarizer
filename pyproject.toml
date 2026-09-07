@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bili-notes"
+version = "2.0.0"
+description = "Bilibili audio and subtitle summarizer with a Qt desktop UI"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7", "google-genai>=2.22,<3", "yt-dlp>=2026.8.19", "keyring>=25.6,<26", "imageio-ffmpeg>=0.6,<0.7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
+
+[project.scripts]
+bili-notes = "bili_notes.ui:main"
+
+[tool.setuptools.packages.find]
+include = ["bili_notes*"]
+
+[tool.setuptools.package-data]
+bili_notes = ["assets/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
