@@ -29,7 +29,7 @@ MEDIA_EXTENSIONS = {
 TEXT_EXTENSIONS = {".txt", ".srt", ".vtt", ".json", ".json3"}
 STYLES = {"concise": "精简速览", "detailed": "详细笔记", "action": "行动清单"}
 MODES = {
-    "auto": "智能模式 · 字幕优先",
+    "auto": "兼容模式 · 单次下载（推荐）",
     "audio": "直接听音频 · 快速总结",
     "transcript": "完整转写 · 再总结",
 }

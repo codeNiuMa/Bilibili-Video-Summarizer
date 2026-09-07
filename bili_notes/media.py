@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .core import Cancelled, TaskError, parse_subtitle
+from .core import Cancelled, TaskError
 
 
 def is_bili_gate(exc):
@@ -13,7 +13,7 @@ def is_bili_gate(exc):
 
 def download_error(exc, fallback):
     if is_bili_gate(exc):
-        return "B 站触发风控（HTTP 412）。请稍后重试，或在设置中提供有效 Cookie；也可以使用已下载的本地文件。"
+        return "B 站暂时拒绝下载请求（HTTP 412）。请稍后重试或使用已下载的本地文件。"
     return fallback
 
 
@@ -52,15 +52,10 @@ class Media:
             "format": "bestaudio/best",
             "outtmpl": str(directory / "source.%(ext)s"),
             "noplaylist": True,
-            "socket_timeout": 20,
-            "retries": 3,
-            "fragment_retries": 3,
-            "concurrent_fragment_downloads": 2,
             "quiet": True,
+            "no_warnings": True,
             "logger": QuietLogger(),
             "progress_hooks": [hook],
-            "overwrites": True,
-            "windowsfilenames": True,
         }
         if self.settings.cookies:
             source = Path(self.settings.cookies).expanduser().resolve()
@@ -73,91 +68,11 @@ class Media:
             opts["cookiefile"] = str(copy)
         return opts
 
-    def resolve(self, url, directory, subtitles=True):
-        import yt_dlp
-
-        self.token.check()
-        self.progress("解析视频", 5, "正在读取标题与可用字幕…")
-        opts = self.options(directory)
-        # Extractor gates subtitle discovery on these flags even with download=False.
-        opts.update({"writesubtitles": subtitles, "writeautomaticsub": subtitles})
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=False)
-                except Exception as exc:
-                    self.token.check()
-                    if subtitles and is_bili_gate(exc):
-                        self.progress(
-                            "字幕接口受限",
-                            9,
-                            "B 站拒绝字幕预解析，正在回退到旧版单次音频下载…",
-                        )
-                        return "B 站视频", None
-                    if not subtitles:
-                        raise
-                    self.progress("字幕提取失败", 8, "重试读取视频信息，并回退为音频处理。")
-                    ydl.params.update({"writesubtitles": False, "writeautomaticsub": False})
-                    info = ydl.extract_info(url, download=False)
-                self.token.check()
-                if not info or info.get("_type") in {"playlist", "multi_video"}:
-                    raise TaskError("请提供单个视频或带 ?p= 分 P 编号的链接。")
-                title = info.get("title") or info.get("id") or "B 站视频"
-                if subtitles:
-                    tracks = dict(info.get("automatic_captions") or {})
-                    tracks.update(info.get("subtitles") or {})
-                    # Prefer Chinese, then English; don't silently translate unrelated tracks.
-                    languages = sorted(
-                        (x for x in tracks if x.startswith(("zh", "ai-zh", "en", "ai-en"))),
-                        key=lambda x: ("zh" not in x, x.startswith("ai-"), x),
-                    )
-                    for language in languages:
-                        self.token.check()
-                        try:
-                            ydl.params.update(
-                                {
-                                    "skip_download": True,
-                                    "writesubtitles": True,
-                                    "writeautomaticsub": True,
-                                    "subtitleslangs": [language],
-                                    "subtitlesformat": "srt/vtt/json3/json/best",
-                                }
-                            )
-                            info["requested_subtitles"] = ydl.process_subtitles(
-                                info["id"], info.get("subtitles"), info.get("automatic_captions")
-                            )
-                            ydl.process_info(info)
-                            for track in (info.get("requested_subtitles") or {}).values():
-                                path = Path(track.get("filepath") or "")
-                                if path.is_file() and path.resolve().is_relative_to(
-                                    directory.resolve()
-                                ):
-                                    text = parse_subtitle(
-                                        path.read_text(encoding="utf-8-sig"), path.suffix
-                                    )
-                                    if text.strip():
-                                        return title, text
-                        except Cancelled:
-                            raise
-                        except Exception:
-                            self.token.check()
-                    self.progress("字幕不可用", 10, "未找到可用字幕，切换为音频处理。")
-                return title, None
-        except (Cancelled, TaskError):
-            raise
-        except Exception as exc:
-            self.token.check()
-            raise TaskError(
-                download_error(
-                    exc,
-                    "视频解析失败。请确认链接可播放；登录视频可设置 Netscape Cookie 文件，风控时稍后重试，并更新 yt-dlp。",
-                )
-            ) from exc
-
     def download(self, url, directory):
         import yt_dlp
 
         self.token.check()
+        self.progress("下载音频", 5, "正在按旧版流程解析并下载音频…")
         try:
             with yt_dlp.YoutubeDL(self.options(directory)) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -178,7 +93,7 @@ class Media:
             self.token.check()
             raise TaskError(
                 download_error(
-                    exc, "音频下载失败。请检查网络、视频权限和 Cookie；可重试或改用本地文件。"
+                    exc, "音频下载失败。请检查网络和视频权限；可稍后重试或改用本地文件。"
                 )
             ) from exc
 

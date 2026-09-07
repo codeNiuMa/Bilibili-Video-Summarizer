@@ -447,7 +447,7 @@ class Window(QMainWindow):
         card_layout.addLayout(options)
         card_layout.addWidget(
             label(
-                "智能模式优先使用字幕；无字幕时上传音频给 Gemini。完整转写模式会额外生成逐字稿。",
+                "B 站链接只请求一次并直接下载音频；完整转写模式会额外生成逐字稿。",
                 "muted",
                 True,
             )

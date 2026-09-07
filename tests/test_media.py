@@ -56,32 +56,6 @@ def test_cookie_file_is_copied_not_modified(tmp_path):
     assert source.read_text() == "# Netscape HTTP Cookie File\n"
 
 
-def test_real_ytdlp_subtitle_writer_with_embedded_subtitle(tmp_path, monkeypatch):
-    import yt_dlp
-
-    info = {
-        "id": "fixture",
-        "title": "字幕样例",
-        "ext": "mp4",
-        "format_id": "test",
-        "url": "https://example.invalid/media",
-        "subtitles": {
-            "zh-CN": [{"ext": "srt", "data": "1\n00:00:01,000 --> 00:00:02,000\n字幕事实\n"}]
-        },
-    }
-
-    def extract(ydl, *args, **kwargs):
-        # Reproduce yt-dlp's real extractor gate; without flags, subtitles are omitted.
-        return info if ydl.params.get("writesubtitles") else {**info, "subtitles": {}}
-
-    monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", extract)
-    media = Media(Settings(), CancelToken(), lambda *args: None)
-    title, subtitle = media.resolve("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path)
-    assert title == "字幕样例"
-    assert subtitle == "[00:00:01] 字幕事实"
-    assert not list(tmp_path.glob("*.mp4"))
-
-
 def test_download_uses_returned_filepath_not_newest_mp3(tmp_path, monkeypatch):
     import yt_dlp
 
@@ -100,34 +74,12 @@ def test_download_uses_returned_filepath_not_newest_mp3(tmp_path, monkeypatch):
     assert media.download("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path) == downloaded
 
 
-def test_subtitle_discovery_failure_retries_without_subtitle_flags(tmp_path, monkeypatch):
-    import yt_dlp
-
-    calls = []
-
-    def extract(ydl, *args, **kwargs):
-        calls.append(ydl.params.get("writesubtitles"))
-        if calls[-1]:
-            raise yt_dlp.utils.DownloadError("subtitle service unavailable")
-        return {"id": "test", "title": "仍可下载的视频"}
-
-    monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", extract)
-    media = Media(Settings(), CancelToken(), lambda *args: None)
-    assert media.resolve("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path) == (
-        "仍可下载的视频",
-        None,
-    )
-    assert calls == [True, False]
-
-
-def test_bilibili_412_during_subtitle_lookup_falls_back_to_audio(tmp_path, monkeypatch):
+def test_bilibili_412_is_reported_after_one_download_attempt(tmp_path, monkeypatch):
     import yt_dlp
 
     extract = Mock(side_effect=yt_dlp.utils.DownloadError("HTTP Error 412: Precondition Failed"))
     monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", extract)
     media = Media(Settings(), CancelToken(), lambda *args: None)
-    assert media.resolve("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path) == (
-        "B 站视频",
-        None,
-    )
+    with pytest.raises(TaskError, match="HTTP 412"):
+        media.download("https://www.bilibili.com/video/BV1xx411c7mD", tmp_path)
     extract.assert_called_once()
