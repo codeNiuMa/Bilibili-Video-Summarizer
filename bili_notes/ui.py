@@ -187,10 +187,13 @@ class ModelJob(QThread):
         self.key = key
 
     def run(self):
-        from google import genai
-        from .gemini import explain_error
-
         try:
+            from .network_ssl import configure_default_ssl_context
+
+            configure_default_ssl_context()
+            from google import genai
+            from .gemini import explain_error
+
             with genai.Client(
                 api_key=self.key, http_options={"timeout": 20000, "retry_options": {"attempts": 1}}
             ) as client:
@@ -203,7 +206,13 @@ class ModelJob(QThread):
                 ]
             self.models.emit(sorted(models))
         except Exception as exc:
-            self.failed.emit(explain_error(exc))
+            try:
+                from .gemini import explain_error
+
+                message = explain_error(exc)
+            except Exception:
+                message = "Gemini SDK 初始化失败，请检查网络、证书和依赖后重试。"
+            self.failed.emit(message)
         finally:
             self.key = ""
 

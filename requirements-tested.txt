@@ -5,3 +5,4 @@ google-genai==2.22.0
 yt-dlp==2026.8.19
 keyring==25.7.0
 imageio-ffmpeg==0.6.0
+certifi==2025.11.12
