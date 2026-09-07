@@ -1,0 +1,5 @@
+PySide6-Essentials>=6.8,<7
+google-genai>=2.22,<3
+yt-dlp>=2026.8.19
+keyring>=25.6,<26
+imageio-ffmpeg>=0.6,<0.7
