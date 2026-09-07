@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from bili_notes.qt_compat import QApplication
 
 from bili_notes.core import Result, Store
 from bili_notes.ui import THEME, Window

@@ -3,14 +3,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QTextDocument, QTextCursor, QTextBlockFormat
-from PySide6.QtWidgets import (
+from .qt_compat import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDesktopServices,
     QDialog,
     QFileDialog,
+    QFont,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -25,8 +25,15 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QTextBrowser,
+    QTextBlockFormat,
+    QTextCursor,
+    QTextDocument,
+    QThread,
+    QTimer,
     QVBoxLayout,
     QWidget,
+    Qt,
+    Signal,
 )
 
 from .core import (
