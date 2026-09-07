@@ -1,4 +1,4 @@
-PySide6-Essentials>=6.7.3,<7
+PySide6-Essentials==6.7.3
 google-genai>=2.22,<3
 yt-dlp>=2026.8.19
 keyring>=25.6,<26
