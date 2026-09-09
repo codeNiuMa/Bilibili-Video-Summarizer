@@ -18,6 +18,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QKeySequence,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -308,6 +310,194 @@ class ToggleSwitch(QAbstractButton):
         painter.drawEllipse(knob_x, 3, 16, 16)
 
 
+class ThemeToggle(QAbstractButton):
+    """
+    顶部浅色 / 深色主题切换按钮。
+
+    checked = True  -> Dark
+    checked = False -> Light
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setCheckable(True)
+        self.setFixedSize(56, 32)
+
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+
+        self.setToolTip("切换深色 / 浅色模式")
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+
+        painter.setRenderHint(
+            QPainter.RenderHint.Antialiasing
+        )
+
+        dark = self.isChecked()
+
+        # =========================
+        # 颜色
+        # =========================
+
+        if dark:
+            track_color = QColor("#252A35")
+            border_color = QColor("#353C49")
+            knob_color = QColor("#343B49")
+
+            moon_color = QColor("#FFD166")
+
+        else:
+            track_color = QColor("#EEF2FA")
+            border_color = QColor("#DDE3EE")
+            knob_color = QColor("#FFFFFF")
+
+            sun_color = QColor("#F4A62A")
+
+        # =========================
+        # 开关轨道
+        # =========================
+
+        track_rect = QRectF(
+            0.5,
+            0.5,
+            self.width() - 1,
+            self.height() - 1,
+        )
+
+        painter.setPen(
+            QPen(border_color, 1)
+        )
+
+        painter.setBrush(track_color)
+
+        painter.drawRoundedRect(
+            track_rect,
+            16,
+            16,
+        )
+
+        # =========================
+        # 滑块位置
+        # =========================
+
+        knob_size = 26
+
+        if dark:
+            knob_x = self.width() - knob_size - 3
+        else:
+            knob_x = 3
+
+        knob_y = 3
+
+        knob_rect = QRectF(
+            knob_x,
+            knob_y,
+            knob_size,
+            knob_size,
+        )
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(knob_color)
+
+        painter.drawEllipse(knob_rect)
+
+        cx = knob_rect.center().x()
+        cy = knob_rect.center().y()
+
+        # =========================
+        # Light → 太阳
+        # =========================
+
+        if not dark:
+
+            painter.setPen(
+                QPen(
+                    sun_color,
+                    1.7,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                )
+            )
+
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+            # 中心太阳
+            painter.drawEllipse(
+                QRectF(
+                    cx - 4,
+                    cy - 4,
+                    8,
+                    8,
+                )
+            )
+
+            # 八条阳光
+            rays = [
+                ((0, -8), (0, -6)),
+                ((0, 8), (0, 6)),
+                ((-8, 0), (-6, 0)),
+                ((8, 0), (6, 0)),
+
+                ((-5.7, -5.7), (-4.3, -4.3)),
+                ((5.7, 5.7), (4.3, 4.3)),
+                ((5.7, -5.7), (4.3, -4.3)),
+                ((-5.7, 5.7), (-4.3, 4.3)),
+            ]
+
+            for start, end in rays:
+                painter.drawLine(
+                    QPointF(
+                        cx + start[0],
+                        cy + start[1],
+                    ),
+                    QPointF(
+                        cx + end[0],
+                        cy + end[1],
+                    ),
+                )
+
+        # =========================
+        # Dark → 月亮
+        # =========================
+
+        else:
+
+            moon = QPainterPath()
+
+            moon.addEllipse(
+                QRectF(
+                    cx - 6,
+                    cy - 6,
+                    12,
+                    12,
+                )
+            )
+
+            cut = QPainterPath()
+
+            cut.addEllipse(
+                QRectF(
+                    cx - 2,
+                    cy - 7,
+                    11,
+                    11,
+                )
+            )
+
+            moon = moon.subtracted(cut)
+
+            painter.fillPath(
+                moon,
+                moon_color,
+            )
+
+        painter.end()
+
+
 class StatusPill(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -487,6 +677,14 @@ class MainWindow(QMainWindow):
         self.log_window: LogWindow | None = None
         self.current_progress = 0
 
+        # =============================
+        # Result / focus UI state
+        # =============================
+
+        self.result_mode = False
+        self.task_details_expanded = False
+        self.focus_mode = False
+
         self._build_shell()
         self._build_sidebar()
         self._build_content()
@@ -494,6 +692,15 @@ class MainWindow(QMainWindow):
         self._refresh_config_labels()
         self._apply_theme()
         self._update_maximize_icon()
+
+        self.focus_shortcut = QShortcut(
+            QKeySequence("Escape"),
+            self,
+        )
+
+        self.focus_shortcut.activated.connect(
+            self._escape_focus_mode
+        )
 
     # ------------------------------------------------------------------
     # Window shell
@@ -710,28 +917,35 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._section_label("设置"))
 
-        self.theme_button = QPushButton("深色模式", self.sidebar)
-        self.theme_button.setObjectName("sidebarAction")
-        self.theme_button.clicked.connect(self.toggle_theme)
-        layout.addWidget(self.theme_button)
-
-        self.api_button = QPushButton("API Key", self.sidebar)
+        self.api_button = QPushButton("🔑   API Key", self.sidebar)
         api_button = self.api_button
         api_button.setObjectName("sidebarAction")
         api_button.clicked.connect(self.set_api_key)
         layout.addWidget(api_button)
 
-        self.cookie_button = QPushButton("Cookie", self.sidebar)
+        self.cookie_button = QPushButton("🍪   Cookie", self.sidebar)
         cookie_button = self.cookie_button
         cookie_button.setObjectName("sidebarAction")
         cookie_button.clicked.connect(self.set_cookie)
         layout.addWidget(cookie_button)
 
-        self.log_button = QPushButton("下载日志", self.sidebar)
+        self.log_button = QPushButton("📜   下载日志", self.sidebar)
         log_button = self.log_button
         log_button.setObjectName("sidebarAction")
         log_button.clicked.connect(self.show_log)
         layout.addWidget(log_button)
+
+        # ===== 彩色 Emoji 字体 =====
+        emoji_font = QFont()
+        emoji_font.setFamilies([
+            "Segoe UI Emoji",
+            "Microsoft YaHei UI",
+        ])
+        emoji_font.setPointSize(11)
+
+        self.api_button.setFont(emoji_font)
+        self.cookie_button.setFont(emoji_font)
+        self.log_button.setFont(emoji_font)
 
         layout.addStretch(1)
         version = QLabel("PySide6 UI · 稳定流程", self.sidebar)
@@ -751,7 +965,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_content(self) -> None:
-        main = QVBoxLayout(self.main_panel)
+        self.main_layout = QVBoxLayout(self.main_panel)
+        main = self.main_layout
+
         main.setContentsMargins(28, 0, 24, 24)
         main.setSpacing(16)
 
@@ -762,18 +978,51 @@ class MainWindow(QMainWindow):
         caption_layout.setContentsMargins(0, 0, 0, 0)
         caption_layout.setSpacing(0)
         caption_layout.addStretch(1)
+
+        # =====================================
+        # 全局主题切换
+        # =====================================
+
+        self.theme_toggle = ThemeToggle(caption)
+
+        self.theme_toggle.setChecked(
+            self.theme == "dark"
+        )
+
+        self.theme_toggle.clicked.connect(
+            self.toggle_theme
+        )
+
+        self.theme_toggle.setToolTip(
+            "切换到浅色模式"
+            if self.theme == "dark"
+            else "切换到深色模式"
+        )
+
+        caption_layout.addWidget(
+            self.theme_toggle,
+            alignment=Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        # 与窗口控制按钮稍微留一点距离
+        caption_layout.addSpacing(10)
+
+        # Windows 风格窗口控制
         caption_layout.addWidget(self._window_button("min"))
         caption_layout.addWidget(self._window_button("max"))
         caption_layout.addWidget(self._window_button("close"))
+
         main.addWidget(caption)
 
         # Page heading is a separate row so the status pill never competes
         # with the caption buttons for vertical alignment.
-        header = DragArea(self.main_panel)
+        self.page_header = DragArea(self.main_panel)
+        header = self.page_header
+
         header.setFixedHeight(84)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 8, 12)
-        header_layout.setSpacing(16)
+        header_layout.setSpacing(10)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
@@ -783,16 +1032,65 @@ class MainWindow(QMainWindow):
         page_subtitle.setObjectName("mutedText")
         title_box.addWidget(page_title)
         title_box.addWidget(page_subtitle)
+
         header_layout.addLayout(title_box, 1)
 
+        # 状态胶囊
         self.status_pill = StatusPill(header)
+
         header_layout.addWidget(
             self.status_pill,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            alignment=(
+                    Qt.AlignmentFlag.AlignRight
+                    | Qt.AlignmentFlag.AlignVCenter
+            ),
         )
         main.addWidget(header)
+        # ==================================================
+        # Collapsed task summary bar
+        # 总结完成后替代输入区 + 进度区
+        # ==================================================
 
-        input_card = QFrame(self.main_panel)
+        self.task_compact_bar = QFrame(self.main_panel)
+        self.task_compact_bar.setObjectName("compactBar")
+        self.task_compact_bar.setFixedHeight(48)
+
+        compact_layout = QHBoxLayout(self.task_compact_bar)
+        compact_layout.setContentsMargins(16, 0, 16, 0)
+        compact_layout.setSpacing(12)
+
+        self.task_toggle_button = QPushButton(
+            "▶  视频与任务信息",
+            self.task_compact_bar,
+        )
+        self.task_toggle_button.setObjectName("compactToggleButton")
+        self.task_toggle_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.task_toggle_button.clicked.connect(
+            self.toggle_task_details
+        )
+
+        compact_layout.addWidget(self.task_toggle_button)
+
+        compact_layout.addStretch(1)
+
+        self.task_summary_label = QLabel(
+            "总结完成 · 100%",
+            self.task_compact_bar,
+        )
+        self.task_summary_label.setObjectName("mutedText")
+
+        compact_layout.addWidget(self.task_summary_label)
+
+        # 初始状态不显示
+        self.task_compact_bar.hide()
+
+        main.addWidget(self.task_compact_bar)
+
+        self.input_card = QFrame(self.main_panel)
+        input_card = self.input_card
+
         input_card.setObjectName("card")
         input_layout = QVBoxLayout(input_card)
         input_layout.setContentsMargins(20, 18, 20, 20)
@@ -856,8 +1154,11 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.drop_card)
         main.addWidget(input_card)
 
-        progress_card = QFrame(self.main_panel)
+        self.progress_card = QFrame(self.main_panel)
+        progress_card = self.progress_card
+
         progress_card.setObjectName("card")
+
         progress_layout = QVBoxLayout(progress_card)
         progress_layout.setContentsMargins(20, 18, 20, 16)
         progress_layout.setSpacing(11)
@@ -889,8 +1190,11 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_text)
         main.addWidget(progress_card)
 
-        result_card = QFrame(self.main_panel)
+        self.result_card = QFrame(self.main_panel)
+        result_card = self.result_card
+
         result_card.setObjectName("card")
+
         result_layout = QVBoxLayout(result_card)
         result_layout.setContentsMargins(20, 16, 20, 18)
         result_layout.setSpacing(10)
@@ -900,6 +1204,29 @@ class MainWindow(QMainWindow):
         result_title.setObjectName("cardTitle")
         result_header.addWidget(result_title)
         result_header.addStretch(1)
+
+        self.focus_button = QPushButton(
+            "专注阅读",
+            result_card,
+        )
+
+        self.focus_button.setObjectName(
+            "secondaryButton"
+        )
+
+        self.focus_button.setEnabled(False)
+
+        self.focus_button.setToolTip(
+            "让总结内容占据整个工作区域"
+        )
+
+        self.focus_button.clicked.connect(
+            self.toggle_focus_mode
+        )
+
+        result_header.addWidget(
+            self.focus_button
+        )
 
         self.copy_button = QPushButton("复制 Markdown", result_card)
         self.copy_button.setObjectName("secondaryButton")
@@ -938,8 +1265,17 @@ class MainWindow(QMainWindow):
             return "dark"
 
     def toggle_theme(self) -> None:
-        self.theme = "light" if self.theme == "dark" else "dark"
-        self.qt_settings.setValue("theme", self.theme)
+        self.theme = (
+            "light"
+            if self.theme == "dark"
+            else "dark"
+        )
+
+        self.qt_settings.setValue(
+            "theme",
+            self.theme,
+        )
+
         self._apply_theme()
 
     def _apply_theme(self) -> None:
@@ -1012,6 +1348,29 @@ class MainWindow(QMainWindow):
                 border: 1px solid {border};
                 border-radius: 13px;
             }}
+            QFrame#compactBar {{
+                background: {card};
+                border: 1px solid {border};
+                border-radius: 11px;
+            }}
+            
+            QPushButton#compactToggleButton {{
+                background: transparent;
+                color: {text};
+                border: none;
+            
+                padding: 0;
+            
+                text-align: left;
+            
+                font-family: "Microsoft YaHei UI";
+                font-size: 12px;
+                font-weight: 650;
+            }}
+            
+            QPushButton#compactToggleButton:hover {{
+                color: {accent};
+            }}
             QFrame#dropCard {{
                 background: {input_bg};
                 border: 1px solid {border};
@@ -1045,8 +1404,19 @@ class MainWindow(QMainWindow):
             QPushButton#secondaryButton:hover, QPushButton#iconButton:hover {{ background: {hover}; }}
             QPushButton#secondaryButton:disabled {{ color: {muted}; background: transparent; }}
             QPushButton#sidebarAction {{
-                background: transparent; color: {text}; border: none; border-radius: 8px;
-                text-align: left; padding: 9px 10px;
+                background: transparent;
+                color: {text};
+                border: none;
+                border-radius: 9px;
+            
+                text-align: left;
+            
+                padding-top: 10px;
+                padding-bottom: 10px;
+                padding-left: 12px;
+                padding-right: 10px;
+            
+                font-size: 12px;
             }}
             QPushButton#sidebarAction:hover {{ background: {hover}; }}
             QPushButton#linkButton {{
@@ -1070,8 +1440,16 @@ class MainWindow(QMainWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             """
         )
+        if hasattr(self, "theme_toggle"):
+            self.theme_toggle.setChecked(dark)
 
-        self.theme_button.setText("浅色模式" if dark else "深色模式")
+            self.theme_toggle.setToolTip(
+                "切换到浅色模式"
+                if dark
+                else "切换到深色模式"
+            )
+
+            self.theme_toggle.update()
         self._update_ui_icons(text=text, muted=muted)
         self.result_browser.document().setDefaultStyleSheet(
             f"""
@@ -1107,19 +1485,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "refresh_models_button"):
             self.refresh_models_button.setIcon(make_icon("refresh", muted, text))
             self.refresh_models_button.setIconSize(QSize(17, 17))
-
-        if hasattr(self, "theme_button"):
-            self.theme_button.setIcon(make_icon("sun" if self.theme == "dark" else "moon", muted, text))
-            self.theme_button.setIconSize(QSize(18, 18))
-        if hasattr(self, "api_button"):
-            self.api_button.setIcon(make_icon("key", muted, text))
-            self.api_button.setIconSize(QSize(18, 18))
-        if hasattr(self, "cookie_button"):
-            self.cookie_button.setIcon(make_icon("cookie", muted, text))
-            self.cookie_button.setIconSize(QSize(18, 18))
-        if hasattr(self, "log_button"):
-            self.log_button.setIcon(make_icon("log", muted, text))
-            self.log_button.setIconSize(QSize(18, 18))
 
     # ------------------------------------------------------------------
     # Settings / input
@@ -1271,6 +1636,191 @@ class MainWindow(QMainWindow):
             self.url_edit.setText(text)
             self._clear_local_file()
 
+    def enter_result_mode(self) -> None:
+        """
+        总结完成后自动进入结果优先模式。
+        输入区和进度区折叠成一条紧凑信息栏。
+        """
+
+        if self.focus_mode:
+            self.exit_focus_mode()
+
+        self.result_mode = True
+        self.task_details_expanded = False
+
+        self.input_card.hide()
+        self.progress_card.hide()
+
+        self.task_compact_bar.show()
+
+        self.task_toggle_button.setText(
+            "▶  视频与任务信息"
+        )
+
+        self.task_summary_label.setText(
+            "总结完成 · 100%"
+        )
+
+        self.focus_button.setEnabled(True)
+
+        # 确保 Markdown 从顶部开始阅读
+        self.result_browser.verticalScrollBar().setValue(0)
+
+        self.result_browser.setFocus()
+
+    def leave_result_mode(self) -> None:
+        """
+        回到普通工作状态。
+        新任务开始时调用。
+        """
+
+        if self.focus_mode:
+            self.exit_focus_mode()
+
+        self.result_mode = False
+        self.task_details_expanded = False
+
+        self.task_compact_bar.hide()
+
+        self.input_card.show()
+        self.progress_card.show()
+
+        self.task_toggle_button.setText(
+            "▶  视频与任务信息"
+        )
+
+    def toggle_task_details(self) -> None:
+        """
+        在结果模式下展开/折叠原来的输入和任务区域。
+        """
+
+        if not self.result_mode:
+            return
+
+        self.task_details_expanded = (
+            not self.task_details_expanded
+        )
+
+        if self.task_details_expanded:
+
+            self.input_card.show()
+            self.progress_card.show()
+
+            self.task_toggle_button.setText(
+                "▼  视频与任务信息"
+            )
+
+        else:
+
+            self.input_card.hide()
+            self.progress_card.hide()
+
+            self.task_toggle_button.setText(
+                "▶  视频与任务信息"
+            )
+
+    def toggle_focus_mode(self) -> None:
+        if self.focus_mode:
+            self.exit_focus_mode()
+        else:
+            self.enter_focus_mode()
+
+    def _escape_focus_mode(self) -> None:
+        if self.focus_mode:
+            self.exit_focus_mode()
+
+    def enter_focus_mode(self) -> None:
+        if not self.result_markdown:
+            return
+
+        self.focus_mode = True
+
+        # 左侧栏完全隐藏
+        self.sidebar.hide()
+
+        # 页面标题隐藏
+        self.page_header.hide()
+
+        # 输入 / 任务信息全部隐藏
+        self.task_compact_bar.hide()
+        self.input_card.hide()
+        self.progress_card.hide()
+
+        # 内容区尽量使用窗口空间
+        self.main_layout.setContentsMargins(
+            18,
+            0,
+            18,
+            18,
+        )
+
+        self.main_layout.setSpacing(8)
+
+        self.focus_button.setText(
+            "退出专注"
+        )
+
+        self.focus_button.setToolTip(
+            "返回正常工作界面"
+        )
+
+        self.result_browser.setFocus()
+
+    def exit_focus_mode(self) -> None:
+        if not self.focus_mode:
+            return
+
+        self.focus_mode = False
+
+        self.sidebar.show()
+        self.page_header.show()
+
+        self.main_layout.setContentsMargins(
+            28,
+            0,
+            24,
+            24,
+        )
+
+        self.main_layout.setSpacing(16)
+
+        self.focus_button.setText(
+            "专注阅读"
+        )
+
+        self.focus_button.setToolTip(
+            "让总结内容占据整个工作区域"
+        )
+
+        # 根据退出专注前所处模式恢复 UI
+        if self.result_mode:
+
+            self.task_compact_bar.show()
+
+            if self.task_details_expanded:
+
+                self.input_card.show()
+                self.progress_card.show()
+
+                self.task_toggle_button.setText(
+                    "▼  视频与任务信息"
+                )
+
+            else:
+
+                self.input_card.hide()
+                self.progress_card.hide()
+
+                self.task_toggle_button.setText(
+                    "▶  视频与任务信息"
+                )
+
+        else:
+
+            self.task_compact_bar.hide()
+            self.input_card.show()
+            self.progress_card.show()
+
     # ------------------------------------------------------------------
     # Processing
     # ------------------------------------------------------------------
@@ -1289,6 +1839,10 @@ class MainWindow(QMainWindow):
         if not url and not local:
             QMessageBox.warning(self, "缺少输入", "请输入 B 站链接，或选择本地音视频文件。")
             return
+        # 新任务开始，退出阅读优先状态
+        self.leave_result_mode()
+
+        self.focus_button.setEnabled(False)
 
         self.result_markdown = ""
         self.result_browser.clear()
@@ -1338,10 +1892,25 @@ class MainWindow(QMainWindow):
 
     def _show_result(self, result: str) -> None:
         self.result_markdown = result
-        self.result_browser.setMarkdown(result)
+
+        self.result_browser.setMarkdown(
+            result
+        )
+
         self.copy_button.setEnabled(True)
         self.save_button.setEnabled(True)
-        self._apply_progress(100, "总结完成")
+        self.focus_button.setEnabled(True)
+
+        self._apply_progress(
+            100,
+            "总结完成",
+        )
+
+        # ===================================
+        # 自动进入结果优先模式
+        # ===================================
+
+        self.enter_result_mode()
 
     def _show_error(self, message: str) -> None:
         self._set_status("处理失败", error=True)
