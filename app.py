@@ -2,41 +2,28 @@ from __future__ import annotations
 
 import json
 import os
-def repair_ssl_environment() -> None:
-    """
-    修复指向不存在文件的 SSL_CERT_FILE。
-
-    某些 Conda 环境切换后可能遗留其他环境的证书路径，
-    导致 httpx / google-genai 初始化 SSL 时直接报 FileNotFoundError。
-    """
-    ssl_cert = os.environ.get("SSL_CERT_FILE")
-
-    if not ssl_cert:
-        return
-
-    if Path(ssl_cert).is_file():
-        return
-
-    try:
-        import certifi
-
-        certifi_path = certifi.where()
-
-        if Path(certifi_path).is_file():
-            os.environ["SSL_CERT_FILE"] = certifi_path
-            return
-    except Exception:
-        pass
-
-    # 如果无法取得 certifi，就删除失效变量，
-    # 让 Python SSL 使用自己的默认验证路径。
-    os.environ.pop("SSL_CERT_FILE", None)
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QEasingCurve,
+    QPointF,
+    Property,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QSettings,
+    QSize,
+    QThread,
+    QTimer,
+    Qt,
+    QUrl,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -106,6 +93,13 @@ FALLBACK_MODELS = [
 
 APP_ORG = "codeNiuMa"
 APP_NAME = "Bilibili Video Summarizer"
+
+# Unified application typography.
+# Chinese and Latin text both use Microsoft YaHei UI.
+# Segoe UI Emoji is kept only as a fallback for emoji glyphs.
+APP_FONT_FAMILY = "Microsoft YaHei UI"
+APP_EMOJI_FAMILY = "Segoe UI Emoji"
+APP_FONT_SIZE = 10
 
 
 def _paint_icon(kind: str, color: str, size: int = 18) -> QPixmap:
@@ -360,190 +354,293 @@ class ToggleSwitch(QAbstractButton):
 
 
 class ThemeToggle(QAbstractButton):
-    """
-    顶部浅色 / 深色主题切换按钮。
-
-    checked = True  -> Dark
-    checked = False -> Light
-    """
+    """Animated light / dark theme switch."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
         self.setCheckable(True)
         self.setFixedSize(56, 32)
-
-        self.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("切换深色 / 浅色模式")
 
-    def paintEvent(self, event):  # noqa: N802
-        painter = QPainter(self)
+        # 0.0 = light/left, 1.0 = dark/right.
+        self._position = 0.0
+        self._position_animation = QPropertyAnimation(self, b"position", self)
+        self._position_animation.setDuration(180)
+        self._position_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self._animate_position)
 
-        painter.setRenderHint(
-            QPainter.RenderHint.Antialiasing
+    def _get_position(self) -> float:
+        return self._position
+
+    def _set_position(self, value: float) -> None:
+        self._position = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    position = Property(float, _get_position, _set_position)
+
+    def _animate_position(self, checked: bool) -> None:
+        self._position_animation.stop()
+        self._position_animation.setStartValue(self._position)
+        self._position_animation.setEndValue(1.0 if checked else 0.0)
+        self._position_animation.start()
+
+    def set_position_immediate(self, value: float) -> None:
+        """Synchronize the knob without animation, useful during startup."""
+        self._position_animation.stop()
+        self._set_position(value)
+
+    @staticmethod
+    def _mix_color(a: str, b: str, t: float) -> QColor:
+        ca = QColor(a)
+        cb = QColor(b)
+        t = max(0.0, min(1.0, t))
+        return QColor(
+            round(ca.red() + (cb.red() - ca.red()) * t),
+            round(ca.green() + (cb.green() - ca.green()) * t),
+            round(ca.blue() + (cb.blue() - ca.blue()) * t),
+            round(ca.alpha() + (cb.alpha() - ca.alpha()) * t),
         )
 
-        dark = self.isChecked()
-
-        # =========================
-        # 颜色
-        # =========================
-
-        if dark:
-            track_color = QColor("#252A35")
-            border_color = QColor("#353C49")
-            knob_color = QColor("#343B49")
-
-            moon_color = QColor("#FFD166")
-
-        else:
-            track_color = QColor("#EEF2FA")
-            border_color = QColor("#DDE3EE")
-            knob_color = QColor("#FFFFFF")
-
-            sun_color = QColor("#F4A62A")
-
-        # =========================
-        # 开关轨道
-        # =========================
-
-        track_rect = QRectF(
-            0.5,
-            0.5,
-            self.width() - 1,
-            self.height() - 1,
-        )
-
+    def _draw_sun(self, painter: QPainter, cx: float, cy: float, opacity: float) -> None:
+        if opacity <= 0.001:
+            return
+        painter.save()
+        painter.setOpacity(opacity)
         painter.setPen(
-            QPen(border_color, 1)
+            QPen(
+                QColor("#F4A62A"),
+                1.7,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+            )
         )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(cx - 4, cy - 4, 8, 8))
+        rays = [
+            ((0, -8), (0, -6)), ((0, 8), (0, 6)),
+            ((-8, 0), (-6, 0)), ((8, 0), (6, 0)),
+            ((-5.7, -5.7), (-4.3, -4.3)), ((5.7, 5.7), (4.3, 4.3)),
+            ((5.7, -5.7), (4.3, -4.3)), ((-5.7, 5.7), (-4.3, 4.3)),
+        ]
+        for start, end in rays:
+            painter.drawLine(
+                QPointF(cx + start[0], cy + start[1]),
+                QPointF(cx + end[0], cy + end[1]),
+            )
+        painter.restore()
 
+    def _draw_moon(self, painter: QPainter, cx: float, cy: float, opacity: float) -> None:
+        if opacity <= 0.001:
+            return
+        painter.save()
+        painter.setOpacity(opacity)
+        moon = QPainterPath()
+        moon.addEllipse(QRectF(cx - 6, cy - 6, 12, 12))
+        cut = QPainterPath()
+        cut.addEllipse(QRectF(cx - 2, cy - 7, 11, 11))
+        painter.fillPath(moon.subtracted(cut), QColor("#FFD166"))
+        painter.restore()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        t = self._position
+
+        # The switch itself also blends its colors while the knob is moving.
+        track_color = self._mix_color("#EEF2FA", "#252A35", t)
+        border_color = self._mix_color("#DDE3EE", "#353C49", t)
+        knob_color = self._mix_color("#FFFFFF", "#343B49", t)
+
+        track_rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        painter.setPen(QPen(border_color, 1))
         painter.setBrush(track_color)
-
-        painter.drawRoundedRect(
-            track_rect,
-            16,
-            16,
-        )
-
-        # =========================
-        # 滑块位置
-        # =========================
+        painter.drawRoundedRect(track_rect, 16, 16)
 
         knob_size = 26
-
-        if dark:
-            knob_x = self.width() - knob_size - 3
-        else:
-            knob_x = 3
-
-        knob_y = 3
-
-        knob_rect = QRectF(
-            knob_x,
-            knob_y,
-            knob_size,
-            knob_size,
-        )
+        knob_x = 3 + (self.width() - knob_size - 6) * t
+        knob_rect = QRectF(knob_x, 3, knob_size, knob_size)
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(knob_color)
-
         painter.drawEllipse(knob_rect)
 
         cx = knob_rect.center().x()
         cy = knob_rect.center().y()
 
-        # =========================
-        # Light → 太阳
-        # =========================
+        # Cross-fade sun/moon while the knob glides across the track.
+        self._draw_sun(painter, cx, cy, 1.0 - t)
+        self._draw_moon(painter, cx, cy, t)
+        painter.end()
 
-        if not dark:
 
-            painter.setPen(
-                QPen(
-                    sun_color,
-                    1.7,
-                    Qt.PenStyle.SolidLine,
-                    Qt.PenCapStyle.RoundCap,
-                )
+class ThemeFadeOverlay(QWidget):
+    """Paint-only snapshot overlay used for a stable theme cross-fade.
+
+    Using a QWidget that paints the cached pixmap itself avoids the extra
+    QGraphicsOpacityEffect composition pass.  That combination can visibly
+    "jump" for frameless translucent windows with drop shadows on Windows.
+    The overlay is never inserted into a layout, so it cannot influence any
+    widget geometry while the theme stylesheet is being replaced.
+    """
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self._pixmap = pixmap
+        self._fade_opacity = 1.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def _get_fade_opacity(self) -> float:
+        return self._fade_opacity
+
+    def _set_fade_opacity(self, value: float) -> None:
+        self._fade_opacity = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    fadeOpacity = Property(float, _get_fade_opacity, _set_fade_opacity)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setOpacity(self._fade_opacity)
+        # QWidget.grab() returns a DPR-aware pixmap. Drawing it into the exact
+        # logical widget rect keeps the snapshot aligned on HiDPI displays.
+        painter.drawPixmap(self.rect(), self._pixmap)
+        painter.end()
+
+
+class SmoothProgressBar(QWidget):
+    """Self-painted determinate / indeterminate progress bar.
+
+    The whole track is repainted on every frame instead of moving a child
+    widget with setGeometry(). This avoids stale-pixel trails on frameless,
+    translucent Windows windows.
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        bar_height: int = 7,
+        segment_ratio: float = 0.22,
+        min_segment: float = 48.0,
+        track_kind: str = "soft",
+    ):
+        super().__init__(parent)
+        self._display_progress = 0.0
+        self._phase = 0.0
+        self._indeterminate = False
+        self._segment_ratio = float(segment_ratio)
+        self._min_segment = float(min_segment)
+        self._track_kind = str(track_kind)
+
+        self.setFixedHeight(int(bar_height))
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        self._progress_animation = QPropertyAnimation(
+            self,
+            b"displayProgress",
+            self,
+        )
+        self._progress_animation.setDuration(300)
+        self._progress_animation.setEasingCurve(
+            QEasingCurve.Type.OutCubic
+        )
+
+    def _get_display_progress(self) -> float:
+        return self._display_progress
+
+    def _set_display_progress(self, value: float) -> None:
+        self._display_progress = max(0.0, min(100.0, float(value)))
+        self.update()
+
+    displayProgress = Property(
+        float,
+        _get_display_progress,
+        _set_display_progress,
+    )
+
+    def set_progress(self, value: float, *, animate: bool = True) -> None:
+        value = max(0.0, min(100.0, float(value)))
+        self._indeterminate = False
+        self._progress_animation.stop()
+
+        if not animate:
+            self._set_display_progress(value)
+            return
+
+        if abs(self._display_progress - value) < 0.01:
+            self.update()
+            return
+
+        self._progress_animation.setStartValue(self._display_progress)
+        self._progress_animation.setEndValue(value)
+        self._progress_animation.start()
+
+    def set_indeterminate(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._indeterminate == enabled:
+            return
+        self._indeterminate = enabled
+        if enabled:
+            self._progress_animation.stop()
+        self.update()
+
+    def set_phase(self, value: float) -> None:
+        self._phase = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    def _track_color(self) -> QColor:
+        dark = getattr(self.window(), "theme", "light") == "dark"
+        if self._track_kind == "border":
+            return QColor("#2A303A" if dark else "#E1E5EC")
+        return QColor("#202631" if dark else "#F1F4FA")
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        width = float(self.width())
+        height = float(self.height())
+        if width <= 0.0 or height <= 0.0:
+            painter.end()
+            return
+
+        track_rect = QRectF(0.0, 0.0, width, height)
+        radius = height / 2.0
+
+        # Paint the entire track first. Any pixels from the previous moving
+        # segment are overwritten before the new segment is drawn.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._track_color())
+        painter.drawRoundedRect(track_rect, radius, radius)
+
+        painter.setBrush(QColor("#4F7DF3"))
+
+        if self._indeterminate:
+            import math
+            ratio = 0.5 - 0.5 * math.cos(2.0 * math.pi * self._phase)
+            segment = min(
+                width,
+                max(self._min_segment, width * self._segment_ratio),
             )
-
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-
-            # 中心太阳
-            painter.drawEllipse(
-                QRectF(
-                    cx - 4,
-                    cy - 4,
-                    8,
-                    8,
-                )
-            )
-
-            # 八条阳光
-            rays = [
-                ((0, -8), (0, -6)),
-                ((0, 8), (0, 6)),
-                ((-8, 0), (-6, 0)),
-                ((8, 0), (6, 0)),
-
-                ((-5.7, -5.7), (-4.3, -4.3)),
-                ((5.7, 5.7), (4.3, 4.3)),
-                ((5.7, -5.7), (4.3, -4.3)),
-                ((-5.7, 5.7), (-4.3, 4.3)),
-            ]
-
-            for start, end in rays:
-                painter.drawLine(
-                    QPointF(
-                        cx + start[0],
-                        cy + start[1],
-                    ),
-                    QPointF(
-                        cx + end[0],
-                        cy + end[1],
-                    ),
-                )
-
-        # =========================
-        # Dark → 月亮
-        # =========================
-
+            travel = max(0.0, width - segment)
+            x = travel * ratio
+            fill_rect = QRectF(x, 0.0, segment, height)
         else:
+            fill_width = width * self._display_progress / 100.0
+            if fill_width <= 0.01:
+                painter.end()
+                return
+            fill_rect = QRectF(0.0, 0.0, fill_width, height)
 
-            moon = QPainterPath()
-
-            moon.addEllipse(
-                QRectF(
-                    cx - 6,
-                    cy - 6,
-                    12,
-                    12,
-                )
-            )
-
-            cut = QPainterPath()
-
-            cut.addEllipse(
-                QRectF(
-                    cx - 2,
-                    cy - 7,
-                    11,
-                    11,
-                )
-            )
-
-            moon = moon.subtracted(cut)
-
-            painter.fillPath(
-                moon,
-                moon_color,
-            )
-
+        fill_radius = min(radius, fill_rect.width() / 2.0)
+        painter.drawRoundedRect(fill_rect, fill_radius, fill_radius)
         painter.end()
 
 
@@ -689,7 +786,7 @@ class LogWindow(QWidget):
         box = QTextEdit(self)
         box.setReadOnly(True)
         box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        box.setFont(QFont("Consolas", 10))
+        box.setFont(QFont(APP_FONT_FAMILY, 10))
         box.setPlainText(text)
         layout.addWidget(box)
 
@@ -746,7 +843,7 @@ class MainWindow(QMainWindow):
         self.activity_tick_count = 0
         self.activity_pulse_bright = False
         self.indeterminate_mode = False
-        self.indeterminate_phase = 0
+        self.indeterminate_phase = 0.0
         self.activity_source_kind = "video"
         self.activity_source_desc = ""
         self.activity_model_desc = ""
@@ -757,6 +854,23 @@ class MainWindow(QMainWindow):
         self.activity_timer = QTimer(self)
         self.activity_timer.setInterval(250)
         self.activity_timer.timeout.connect(self._tick_activity)
+
+        # Smooth infinite movement used while Gemini inference has no real
+        # percentage. A cosine trajectory gives zero velocity at both ends.
+        self.indeterminate_animation = QVariantAnimation(self)
+        self.indeterminate_animation.setStartValue(0.0)
+        self.indeterminate_animation.setEndValue(1.0)
+        self.indeterminate_animation.setDuration(1800)
+        self.indeterminate_animation.setLoopCount(-1)
+        self.indeterminate_animation.setEasingCurve(QEasingCurve.Type.Linear)
+        self.indeterminate_animation.valueChanged.connect(
+            self._on_indeterminate_phase
+        )
+
+        # Keep the theme cross-fade objects alive until their animation ends.
+        # The overlay is a paint-only child of centralWidget(), never a layout item.
+        self._theme_overlay: ThemeFadeOverlay | None = None
+        self._theme_fade_animation: QPropertyAnimation | None = None
 
         self._build_shell()
         self._build_sidebar()
@@ -876,12 +990,14 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._position_resize_handles()
-        if hasattr(self, "progress_track"):
-            self._sync_progress_fill()
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.update()
+        if self._theme_overlay is not None and self.centralWidget() is not None:
+            self._theme_overlay.setGeometry(self.centralWidget().rect())
         if getattr(self, "activity_panel_expanded", False):
             self._position_activity_panel()
-        if hasattr(self, "activity_wait_track"):
-            self._sync_activity_wait_fill()
+        if hasattr(self, "activity_wait_bar"):
+            self.activity_wait_bar.update()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
@@ -929,7 +1045,7 @@ class MainWindow(QMainWindow):
 
         brand_text = QVBoxLayout()
         brand_text.setSpacing(2)
-        title = QLabel("Bili Summary", brand)
+        title = QLabel("BiliSummary", brand)
         title.setObjectName("brandTitle")
         subtitle = QLabel("AI 视频笔记助手", brand)
         subtitle.setObjectName("mutedText")
@@ -1015,8 +1131,8 @@ class MainWindow(QMainWindow):
         # ===== 彩色 Emoji 字体 =====
         emoji_font = QFont()
         emoji_font.setFamilies([
-            "Segoe UI Emoji",
-            "Microsoft YaHei UI",
+            APP_FONT_FAMILY,
+            APP_EMOJI_FAMILY,
         ])
         emoji_font.setPointSize(11)
 
@@ -1064,6 +1180,9 @@ class MainWindow(QMainWindow):
 
         self.theme_toggle.setChecked(
             self.theme == "dark"
+        )
+        self.theme_toggle.set_position_immediate(
+            1.0 if self.theme == "dark" else 0.0
         )
 
         self.theme_toggle.clicked.connect(
@@ -1248,13 +1367,14 @@ class MainWindow(QMainWindow):
 
         bar_row = QHBoxLayout()
         bar_row.setSpacing(12)
-        self.progress_track = QFrame(progress_card)
-        self.progress_track.setObjectName("progressTrack")
-        self.progress_track.setFixedHeight(7)
-        self.progress_fill = QFrame(self.progress_track)
-        self.progress_fill.setObjectName("progressFill")
-        self.progress_fill.setGeometry(0, 0, 0, 7)
-        bar_row.addWidget(self.progress_track, 1)
+        self.progress_bar = SmoothProgressBar(
+            progress_card,
+            bar_height=7,
+            segment_ratio=0.22,
+            min_segment=48.0,
+            track_kind="soft",
+        )
+        bar_row.addWidget(self.progress_bar, 1)
         self.percent_label = QLabel("0%", progress_card)
         self.percent_label.setObjectName("monoMuted")
         self.percent_label.setFixedWidth(68)
@@ -1431,14 +1551,14 @@ class MainWindow(QMainWindow):
 
         activity_layout.addLayout(stage_grid)
 
-        self.activity_wait_track = QFrame(self.activity_panel)
-        self.activity_wait_track.setObjectName("activityWaitTrack")
-        self.activity_wait_track.setFixedHeight(5)
-
-        self.activity_wait_fill = QFrame(self.activity_wait_track)
-        self.activity_wait_fill.setObjectName("activityWaitFill")
-        self.activity_wait_fill.setGeometry(0, 0, 0, 5)
-        activity_layout.addWidget(self.activity_wait_track)
+        self.activity_wait_bar = SmoothProgressBar(
+            self.activity_panel,
+            bar_height=5,
+            segment_ratio=0.24,
+            min_segment=40.0,
+            track_kind="border",
+        )
+        activity_layout.addWidget(self.activity_wait_bar)
 
         self.activity_hint_label = QLabel(
             "详细状态会持续更新；收起此面板不会影响任务运行。",
@@ -1541,7 +1661,90 @@ class MainWindow(QMainWindow):
             self.theme,
         )
 
-        self._apply_theme()
+        self._animate_theme_transition()
+
+    def _clear_theme_overlay(self) -> None:
+        if self._theme_fade_animation is not None:
+            self._theme_fade_animation.stop()
+            self._theme_fade_animation = None
+        if self._theme_overlay is not None:
+            self._theme_overlay.hide()
+            self._theme_overlay.deleteLater()
+            self._theme_overlay = None
+
+    def _animate_theme_transition(self) -> None:
+        """Switch themes without the one-frame shake seen on Windows.
+
+        The previous version used a QLabel + QGraphicsOpacityEffect on top of a
+        frameless translucent window that already contains a drop-shadow effect.
+        On Windows that can force an extra off-screen composition pass and make
+        the whole frame appear to jump for a frame.
+
+        This version snapshots the *central widget* (including the frame and its
+        shadow margins), paints that snapshot in a lightweight overlay, freezes
+        visible updates while QSS is swapped, then fades only the cached pixels.
+        No animation frame changes layout or reapplies the stylesheet.
+        """
+        self._clear_theme_overlay()
+
+        root = self.centralWidget()
+        if root is None or not root.isVisible():
+            self._apply_theme()
+            return
+
+        # Snapshot the exact root coordinate system rather than self.frame.
+        # self.frame has a QGraphicsDropShadowEffect; grabbing the frame itself
+        # can produce a subtly different rasterized bound on Windows/HiDPI.
+        snapshot = root.grab()
+        if snapshot.isNull():
+            self._apply_theme()
+            return
+
+        overlay = ThemeFadeOverlay(snapshot, root)
+        overlay.setGeometry(root.rect())
+        overlay.raise_()
+        overlay.show()
+        self._theme_overlay = overlay
+
+        # Preserve result reading position because re-applying Markdown styles
+        # can trigger a document relayout even though widget geometry is fixed.
+        scroll_value = None
+        if hasattr(self, "result_browser"):
+            scroll_value = self.result_browser.verticalScrollBar().value()
+
+        # QSS replacement can invalidate size hints for many descendants. Freeze
+        # painting for that single operation so the intermediate relayout is never
+        # exposed; the cached overlay remains the visible frame.
+        root.setUpdatesEnabled(False)
+        try:
+            self._apply_theme()
+            if scroll_value is not None:
+                self.result_browser.verticalScrollBar().setValue(scroll_value)
+        finally:
+            root.setUpdatesEnabled(True)
+
+        root.update()
+        overlay.raise_()
+
+        animation = QPropertyAnimation(overlay, b"fadeOpacity", overlay)
+        animation.setDuration(300)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._theme_fade_animation = animation
+
+        def cleanup() -> None:
+            if self._theme_overlay is overlay:
+                self._theme_overlay = None
+            if self._theme_fade_animation is animation:
+                self._theme_fade_animation = None
+            overlay.hide()
+            overlay.deleteLater()
+
+        animation.finished.connect(cleanup)
+        # Let Qt commit the newly styled backing widgets before the first fade
+        # frame. This prevents a single blank/repaint frame on some Windows GPUs.
+        QTimer.singleShot(0, animation.start)
 
     def _apply_theme(self) -> None:
         dark = self.theme == "dark"
@@ -1595,7 +1798,7 @@ class MainWindow(QMainWindow):
             }}
             QLabel {{ color: {text}; font-family: "Microsoft YaHei UI"; font-size: 12px; }}
             QLabel#mutedText {{ color: {muted}; font-size: 11px; }}
-            QLabel#monoMuted {{ color: {muted}; font-family: Consolas; font-size: 10px; }}
+            QLabel#monoMuted {{ color: {muted}; font-family: "Microsoft YaHei UI"; font-size: 10px; }}
             QLabel#sectionLabel {{ color: {muted}; font-weight: 600; font-size: 11px; padding-top: 5px; }}
             QLabel#brandLogo {{ background: {accent}; color: white; border-radius: 12px; font-size: 22px; font-weight: 700; }}
             QLabel#brandTitle {{ font-size: 18px; font-weight: 700; }}
@@ -1693,8 +1896,6 @@ class MainWindow(QMainWindow):
             }}
             QPushButton#windowButton:hover {{ background: {hover}; }}
             QPushButton#windowButtonClose:hover {{ background: #C42B1C; }}
-            QFrame#progressTrack {{ background: {soft}; border: none; border-radius: 3px; }}
-            QFrame#progressFill {{ background: {accent}; border: none; border-radius: 3px; }}
 
             QPushButton#activityToggleButton {{
                 background: transparent;
@@ -1750,7 +1951,7 @@ class MainWindow(QMainWindow):
             QLabel#activityElapsed {{
                 color: {muted};
                 border: none;
-                font-family: Consolas;
+                font-family: "Microsoft YaHei UI";
                 font-size: 10px;
             }}
             QLabel#activityMetaKey {{
@@ -1787,7 +1988,7 @@ class MainWindow(QMainWindow):
             QLabel#activityStageTime {{
                 color: {muted};
                 border: none;
-                font-family: Consolas;
+                font-family: "Microsoft YaHei UI";
                 font-size: 10px;
             }}
             QLabel#activityHint {{
@@ -1796,17 +1997,6 @@ class MainWindow(QMainWindow):
                 font-size: 10px;
                 padding-top: 1px;
             }}
-            QFrame#activityWaitTrack {{
-                background: {border};
-                border: none;
-                border-radius: 2px;
-            }}
-            QFrame#activityWaitFill {{
-                background: {accent};
-                border: none;
-                border-radius: 2px;
-            }}
-
             QTextBrowser#resultBrowser {{
                 background: {result_bg}; color: {text}; border: none; border-radius: 10px;
                 padding: 9px; font-family: "Microsoft YaHei UI"; font-size: 13px;
@@ -1827,6 +2017,12 @@ class MainWindow(QMainWindow):
             )
 
             self.theme_toggle.update()
+
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.update()
+        if hasattr(self, "activity_wait_bar"):
+            self.activity_wait_bar.update()
+
         self._update_ui_icons(text=text, muted=muted)
         self.result_browser.document().setDefaultStyleSheet(
             f"""
@@ -1837,7 +2033,7 @@ class MainWindow(QMainWindow):
             p {{ margin: 6px 0; }}
             li {{ margin: 4px 0; }}
             blockquote {{ color: {muted}; border-left: 3px solid {accent}; margin-left: 8px; padding-left: 10px; }}
-            code {{ font-family: Consolas; background-color: {soft}; }}
+            code {{ font-family: "Microsoft YaHei UI"; background-color: {soft}; }}
             """
         )
         if self.result_markdown:
@@ -2318,7 +2514,8 @@ class MainWindow(QMainWindow):
         self.activity_tick_count = 0
         self.activity_pulse_bright = False
         self.indeterminate_mode = False
-        self.indeterminate_phase = 0
+        self.indeterminate_phase = 0.0
+        self.indeterminate_animation.stop()
         self.activity_media_info = {}
         self.activity_failed_stage = None
         self.activity_model_desc = str(self.settings.model or "").strip() or "Gemini"
@@ -2392,7 +2589,14 @@ class MainWindow(QMainWindow):
         elif new_stage == "inference":
             self.activity_inference_started = now
             self.indeterminate_mode = True
-            self.indeterminate_phase = 0
+            self.indeterminate_phase = 0.0
+            self.progress_bar.set_indeterminate(True)
+            self.progress_bar.set_phase(0.0)
+            self.activity_wait_bar.set_indeterminate(True)
+            self.activity_wait_bar.set_phase(0.0)
+
+            self.indeterminate_animation.stop()
+            self.indeterminate_animation.start()
             self.activity_title.setText("Gemini 正在生成视频笔记")
             self.activity_hint_label.setText(
                 "已向模型提交完整音频，正在等待 Gemini 返回总结。程序仍在正常运行。"
@@ -2420,6 +2624,7 @@ class MainWindow(QMainWindow):
 
         self.activity_running = False
         self.indeterminate_mode = False
+        self.indeterminate_animation.stop()
         self.activity_timer.stop()
 
         total = (
@@ -2436,12 +2641,8 @@ class MainWindow(QMainWindow):
                 f"全部阶段已完成 · 总耗时 {self._format_clock(total)}"
             )
             self.activity_pulse.setProperty("bright", True)
-            self.activity_wait_fill.setGeometry(
-                0,
-                0,
-                max(0, self.activity_wait_track.width()),
-                self.activity_wait_track.height(),
-            )
+            self.activity_wait_bar.set_indeterminate(False)
+            self.activity_wait_bar.set_progress(100, animate=False)
         else:
             self.activity_failed_stage = self.activity_stage
             self.activity_stage = "failed"
@@ -2450,6 +2651,11 @@ class MainWindow(QMainWindow):
                 "任务没有正常完成。请查看上方错误信息或下载日志。"
             )
             self.activity_pulse.setProperty("bright", False)
+            self.activity_wait_bar.set_indeterminate(False)
+            self.activity_wait_bar.set_progress(
+                self.current_progress,
+                animate=False,
+            )
 
         self.activity_pulse.style().unpolish(self.activity_pulse)
         self.activity_pulse.style().polish(self.activity_pulse)
@@ -2580,7 +2786,7 @@ class MainWindow(QMainWindow):
             self.activity_panel.show()
             self.activity_panel.raise_()
             self.activity_toggle_button.setText("收起任务状态  ▴")
-            self._sync_activity_wait_fill()
+            self._sync_activity_wait_fill(animate=False)
         else:
             self.activity_panel.hide()
             self.activity_toggle_button.setText("查看任务状态  ▾")
@@ -2631,10 +2837,8 @@ class MainWindow(QMainWindow):
                 f"{self._activity_hint_for_wait(wait)}"
             )
 
-            # Indeterminate movement: deliberately does not invent a fake percentage.
-            self.indeterminate_phase = (self.indeterminate_phase + 12) % 200
-            self._sync_progress_fill()
-            self._sync_activity_wait_fill()
+            # The indeterminate bars are animated continuously by
+            # QVariantAnimation; this timer only updates text/elapsed time.
 
         elif self.activity_stage == "upload":
             self.activity_hint_label.setText(
@@ -2644,26 +2848,52 @@ class MainWindow(QMainWindow):
 
         self._render_activity_timeline(now)
 
-    def _sync_activity_wait_fill(self) -> None:
-        if not hasattr(self, "activity_wait_track"):
+    def _on_indeterminate_phase(self, value) -> None:
+        if not self.indeterminate_mode:
+            return
+        self.indeterminate_phase = float(value)
+        self._sync_progress_fill(animate=False)
+        self._sync_activity_wait_fill(animate=False)
+
+    @staticmethod
+    def _indeterminate_ratio(phase: float) -> float:
+        # 0 -> 1 -> 0 with smooth zero-velocity turns at both edges.
+        import math
+        return 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+
+    @staticmethod
+    def _animate_geometry(
+            animation: QPropertyAnimation,
+            widget: QWidget,
+            target: QRect,
+            *,
+            animate: bool,
+    ) -> None:
+        if not animate:
+            animation.stop()
+            widget.setGeometry(target)
             return
 
-        width = max(0, self.activity_wait_track.width())
-        height = max(1, self.activity_wait_track.height())
+        current = widget.geometry()
+        if current == target:
+            return
 
+        animation.stop()
+        animation.setStartValue(current)
+        animation.setEndValue(target)
+        animation.start()
+
+    def _sync_activity_wait_fill(self, *, animate: bool = True) -> None:
+        if not hasattr(self, "activity_wait_bar"):
+            return
+
+        self.activity_wait_bar.set_indeterminate(self.indeterminate_mode)
         if self.indeterminate_mode:
-            segment = max(40, int(width * 0.24))
-            travel = max(0, width - segment)
-            phase = self.indeterminate_phase
-            ratio = phase / 100 if phase <= 100 else (200 - phase) / 100
-            x = int(travel * ratio)
-            self.activity_wait_fill.setGeometry(x, 0, segment, height)
+            self.activity_wait_bar.set_phase(self.indeterminate_phase)
         else:
-            self.activity_wait_fill.setGeometry(
-                0,
-                0,
-                int(width * self.current_progress / 100),
-                height,
+            self.activity_wait_bar.set_progress(
+                self.current_progress,
+                animate=animate,
             )
 
     def _apply_progress(self, percent: int, text: str) -> None:
@@ -2685,26 +2915,17 @@ class MainWindow(QMainWindow):
         self.progress_text.setText(text)
         self._set_status(text)
 
-    def _sync_progress_fill(self) -> None:
-        if not hasattr(self, "progress_track"):
+    def _sync_progress_fill(self, *, animate: bool = True) -> None:
+        if not hasattr(self, "progress_bar"):
             return
 
-        width = max(0, self.progress_track.width())
-        height = 7
-
+        self.progress_bar.set_indeterminate(self.indeterminate_mode)
         if self.indeterminate_mode:
-            segment = max(48, int(width * 0.22))
-            travel = max(0, width - segment)
-            phase = self.indeterminate_phase
-            ratio = phase / 100 if phase <= 100 else (200 - phase) / 100
-            x = int(travel * ratio)
-            self.progress_fill.setGeometry(x, 0, segment, height)
+            self.progress_bar.set_phase(self.indeterminate_phase)
         else:
-            self.progress_fill.setGeometry(
-                0,
-                0,
-                int(width * self.current_progress / 100),
-                height,
+            self.progress_bar.set_progress(
+                self.current_progress,
+                animate=animate,
             )
 
     def _show_result(self, result: str) -> None:
@@ -2806,13 +3027,15 @@ class MainWindow(QMainWindow):
 
 
 def run() -> None:
-    repair_ssl_environment()
-
-    app = QApplication.instance() or QApplication([])
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
     app.setStyle("Fusion")
+
+    # Global font baseline: labels, buttons, inputs, combo boxes,
+    # dialogs and other Qt controls inherit Microsoft YaHei UI.
+    app_font = QFont(APP_FONT_FAMILY, APP_FONT_SIZE)
+    app.setFont(app_font)
 
     window = MainWindow()
     window.show()
