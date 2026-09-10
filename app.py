@@ -15,20 +15,17 @@ from PySide6.QtWidgets import (
     QSizePolicy, QTextBrowser, QVBoxLayout, QWidget, QDialog,
 )
 
-from settings import DOWNLOAD_DIR, LOG_DIR, load_api_key, load_settings, save_api_key, save_settings
+from settings import DOWNLOAD_DIR, LOG_DIR, load_api_key, load_api_keys, load_model_cache, load_settings, save_api_key, save_model_cache, save_settings
 from workers import ModelRefreshThread, ProcessingThread
 from ui_widgets import (
     APP_EMOJI_FAMILY, APP_FONT_FAMILY, APP_FONT_SIZE, SUPPORTED_MEDIA, DragArea,
-    DropCard, LogWindow, ResizeHandle, SmoothProgressBar, StatusPill, ThemeFadeOverlay,
+    DropCard, LogWindow, ResizeHandle, SmartComboBox, SmoothProgressBar, StatusPill, ThemeFadeOverlay,
     ThemeToggle, ToggleSwitch, make_icon,
 )
 from dialogs import FriendlyErrorDialog, SettingsDialog, ToastManager, classify_error
-
-FALLBACK_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
-]
+from ai.base import ProviderError
+from ai.catalog import PROVIDERS, provider_display_name, provider_fallback_models
+from ai.manager import validate_provider_configuration
 
 APP_ORG = "codeNiuMa"
 APP_NAME = "Bilibili Video Summarizer"
@@ -50,7 +47,21 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(False)
 
         self.settings = load_settings()
-        self.api_key = load_api_key()
+        self.api_keys = load_api_keys()
+
+        # Restore the last successfully refreshed provider model lists from
+        # disk. This makes model selectors useful immediately after startup;
+        # users only refresh when they actually want newer server data.
+        cached_models = load_model_cache()
+        self.models_by_provider = {}
+        for provider_id in PROVIDERS:
+            current_model = self.settings.get_model(provider_id)
+            merged = list(dict.fromkeys(
+                list(cached_models.get(provider_id, []))
+                + ([current_model] if current_model else [])
+                + provider_fallback_models(provider_id)
+            ))
+            self.models_by_provider[provider_id] = merged
         self.local_file = ""
         self.result_markdown = ""
         self.processing_thread: ProcessingThread | None = None
@@ -70,7 +81,7 @@ class MainWindow(QMainWindow):
         self.focus_mode = False
 
         # ==========================================
-        # Live processing feedback / Gemini activity
+        # Live processing feedback / AI provider activity
         # ==========================================
         self.activity_running = False
         self.activity_stage = "idle"
@@ -93,7 +104,7 @@ class MainWindow(QMainWindow):
         self.activity_timer.setInterval(250)
         self.activity_timer.timeout.connect(self._tick_activity)
 
-        # Smooth infinite movement used while Gemini inference has no real
+        # Smooth infinite movement used while AI inference has no real
         # percentage. A cosine trajectory gives zero velocity at both ends.
         self.indeterminate_animation = QVariantAnimation(self)
         self.indeterminate_animation.setStartValue(0.0)
@@ -309,24 +320,39 @@ class MainWindow(QMainWindow):
         conn.addWidget(self.cookie_status)
         layout.addWidget(connection_card)
 
+        layout.addWidget(self._section_label("AI 服务商"))
+        self.provider_combo = SmartComboBox(self.sidebar, max_visible_items=8, max_popup_width=330)
+        self.provider_combo.setObjectName("providerCombo")
+        self.provider_combo.setMinimumHeight(42)
+        for provider_id, spec in PROVIDERS.items():
+            self.provider_combo.addItem(spec.display_name, provider_id)
+        provider_index = self.provider_combo.findData(self.settings.provider)
+        self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        layout.addWidget(self.provider_combo)
+
         layout.addWidget(self._section_label("AI 模型"))
         model_row = QHBoxLayout()
         model_row.setSpacing(7)
-        self.model_combo = QComboBox(self.sidebar)
+        self.model_combo = SmartComboBox(self.sidebar, max_visible_items=9, max_popup_width=460)
         self.model_combo.setObjectName("modelCombo")
         self.model_combo.setMinimumHeight(42)
-        model_values = list(FALLBACK_MODELS)
-        if self.settings.model not in model_values:
-            model_values.insert(0, self.settings.model)
+        # 模型仅允许从列表选择，禁止手动输入任意模型名。
+        self.model_combo.setEditable(False)
+        current_provider = self.settings.provider
+        model_values = list(self.models_by_provider.get(current_provider, []))
+        current_model = self.settings.get_model(current_provider)
+        if current_model and current_model not in model_values:
+            model_values.insert(0, current_model)
         self.model_combo.addItems(model_values)
-        self.model_combo.setCurrentText(self.settings.model)
+        self.model_combo.setCurrentText(current_model)
         self.model_combo.currentTextChanged.connect(self._model_changed)
         model_row.addWidget(self.model_combo, 1)
 
         self.refresh_models_button = QPushButton("", self.sidebar)
         self.refresh_models_button.setObjectName("iconButton")
         self.refresh_models_button.setFixedSize(42, 42)
-        self.refresh_models_button.setToolTip("根据当前 API Key 刷新可用模型")
+        self.refresh_models_button.setToolTip("根据当前服务商 API Key 刷新可用模型")
         self.refresh_models_button.clicked.connect(self.refresh_models)
         model_row.addWidget(self.refresh_models_button)
         layout.addLayout(model_row)
@@ -371,7 +397,7 @@ class MainWindow(QMainWindow):
         version = QLabel("PySide6 UI · 稳定流程", self.sidebar)
         version.setObjectName("mutedText")
         layout.addWidget(version)
-        pipeline = QLabel("yt-dlp  →  FFmpeg  →  Gemini", self.sidebar)
+        pipeline = QLabel("yt-dlp  →  FFmpeg  →  AI", self.sidebar)
         pipeline.setObjectName("monoMuted")
         layout.addWidget(pipeline)
 
@@ -451,7 +477,7 @@ class MainWindow(QMainWindow):
         title_box.setSpacing(4)
         page_title = QLabel("视频摘要", header)
         page_title.setObjectName("pageTitle")
-        page_subtitle = QLabel("粘贴 B 站链接，或拖入本地音视频，让 Gemini 提炼核心内容。", header)
+        page_subtitle = QLabel("粘贴 B 站链接，或拖入本地音视频，让 AI 提炼核心内容。", header)
         page_subtitle.setObjectName("mutedText")
         title_box.addWidget(page_title)
         title_box.addWidget(page_subtitle)
@@ -625,7 +651,7 @@ class MainWindow(QMainWindow):
         self.activity_toggle_button.setObjectName("activityToggleButton")
         self.activity_toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.activity_toggle_button.setFixedHeight(30)
-        self.activity_toggle_button.setToolTip("展开下载、音频处理、Gemini 上传与 AI 推理的详细状态")
+        self.activity_toggle_button.setToolTip("展开下载、音频处理、转写与 AI 推理的详细状态")
         self.activity_toggle_button.clicked.connect(self.toggle_activity_panel)
         status_row.addWidget(self.activity_toggle_button)
 
@@ -712,7 +738,7 @@ class MainWindow(QMainWindow):
         self.activity_source_value.setWordWrap(True)
         self.activity_source_value.setMinimumHeight(24)
 
-        audio_key = QLabel("Gemini 音频", self.activity_panel)
+        audio_key = QLabel("AI 输入音频", self.activity_panel)
         audio_key.setObjectName("activityMetaKey")
         self.activity_audio_value = QLabel("—", self.activity_panel)
         self.activity_audio_value.setObjectName("activityMetaValue")
@@ -726,6 +752,14 @@ class MainWindow(QMainWindow):
         meta_grid.addWidget(self.activity_source_value, 1, 1)
         meta_grid.addWidget(self.activity_audio_value, 1, 2)
         activity_layout.addLayout(meta_grid)
+
+        self.activity_route_label = QLabel("", self.activity_panel)
+        self.activity_route_label.setObjectName("activityRoute")
+        self.activity_route_label.setWordWrap(True)
+        self.activity_route_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        activity_layout.addWidget(self.activity_route_label)
 
         section_title = QLabel("任务阶段", self.activity_panel)
         section_title.setObjectName("activitySectionTitle")
@@ -744,7 +778,7 @@ class MainWindow(QMainWindow):
         stage_defs = [
             ("source", "获取 B站音频"),
             ("normalize", "音频预处理"),
-            ("upload", "上传 / 处理 Gemini 音频"),
+            ("upload", "准备 AI 输入"),
             ("inference", "AI 生成结构化摘要"),
         ]
 
@@ -1076,14 +1110,29 @@ class MainWindow(QMainWindow):
                 border-radius: 10px; padding: 0 13px; selection-background-color: {accent};
             }}
             QLineEdit#urlEdit:focus {{ border: 1px solid {accent}; }}
-            QComboBox#modelCombo {{
+            QComboBox#modelCombo, QComboBox#providerCombo {{
                 background: {input_bg}; color: {text}; border: 1px solid {border};
-                border-radius: 9px; padding: 0 10px;
+                border-radius: 9px; padding: 0 34px 0 10px;
             }}
-            QComboBox#modelCombo::drop-down {{ border: none; width: 28px; }}
+            QComboBox#modelCombo::drop-down, QComboBox#providerCombo::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                border: none;
+                width: 32px;
+            }}
+            QComboBox#modelCombo::down-arrow, QComboBox#providerCombo::down-arrow {{
+                image: none;
+                width: 0;
+                height: 0;
+            }}
             QComboBox QAbstractItemView {{
                 background: {card}; color: {text}; selection-background-color: {accent};
-                border: 1px solid {border}; outline: 0;
+                selection-color: white; border: 1px solid {border}; outline: 0;
+                padding: 3px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 30px;
+                padding: 4px 8px;
             }}
             QPushButton {{ font-family: "Microsoft YaHei UI"; }}
             QPushButton#primaryButton {{
@@ -1291,21 +1340,61 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _refresh_config_labels(self) -> None:
-        self.api_status.setText("●  API Key 已配置" if self.api_key else "●  API Key 未配置")
+        provider_id = self.settings.provider
+        provider_name = provider_display_name(provider_id)
+        key = load_api_key(provider_id)
+        self.api_keys = load_api_keys()
+        self.api_status.setText(
+            f"●  {provider_name} 已配置" if key else f"●  {provider_name} 未配置"
+        )
         cookie = Path(self.settings.cookie_file).name if self.settings.cookie_file else "未使用"
         self.cookie_status.setText(f"Cookie：{cookie}")
 
     def _toast(self, text: str, kind: str = "info", duration: int = 2600) -> None:
         self.toasts.show(text, kind=kind, duration=duration)
 
+    def _sync_provider_controls(self) -> None:
+        provider_id = self.settings.provider
+
+        self.provider_combo.blockSignals(True)
+        index = self.provider_combo.findData(provider_id)
+        self.provider_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.provider_combo.blockSignals(False)
+
+        current_model = self.settings.get_model(provider_id)
+        models = list(self.models_by_provider.get(provider_id, []))
+        if current_model and current_model not in models:
+            models.insert(0, current_model)
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItems(models)
+        self.model_combo.setCurrentText(current_model)
+        self.model_combo.blockSignals(False)
+
+        self.refresh_models_button.setToolTip(
+            f"刷新 {provider_display_name(provider_id)} 可用模型"
+        )
+        self._refresh_config_labels()
+
     def open_settings(self) -> None:
-        self.api_key = load_api_key()
-        models = [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
+        self.api_keys = load_api_keys()
+        # Keep the current sidebar model list in the provider cache before opening.
+        active_provider = self.settings.provider
+        self.models_by_provider[active_provider] = [
+            self.model_combo.itemText(i)
+            for i in range(self.model_combo.count())
+            if self.model_combo.itemText(i).strip()
+        ]
+
         dialog = SettingsDialog(
-            api_key=self.api_key,
+            provider_id=self.settings.provider,
+            api_keys=self.api_keys,
+            provider_models=dict(self.settings.provider_models),
+            models_by_provider=dict(self.models_by_provider),
+            transcription_provider=self.settings.transcription_provider,
+            transcription_models=dict(self.settings.transcription_models),
             cookie_file=self.settings.cookie_file,
-            model=self.settings.model,
-            models=models,
             keep_download=self.settings.keep_download,
             theme=self.theme,
             parent=self,
@@ -1314,62 +1403,104 @@ class MainWindow(QMainWindow):
             return
 
         values = dialog.values()
-        api_from_env = bool(values["api_from_env"])
-        api_key = str(values["api_key"]).strip()
-        cookie_file = str(values["cookie_file"]).strip()
-        model = str(values["model"]).strip()
-        keep_download = bool(values["keep_download"])
-        requested_theme = str(values["theme"])
 
-        if not api_from_env:
-            save_api_key(api_key)
-        self.api_key = load_api_key() if api_from_env else api_key
+        # Settings can refresh provider lists itself. Re-read the persistent
+        # cache so those fresh lists immediately propagate back to the sidebar.
+        refreshed_cache = load_model_cache()
+        for provider_id, models in refreshed_cache.items():
+            if models:
+                self.models_by_provider[provider_id] = list(models)
 
-        self.settings.cookie_file = cookie_file
-        if model:
-            self.settings.model = model
-        self.settings.keep_download = keep_download
+        api_keys = dict(values["api_keys"])
+        api_from_env = dict(values["api_from_env"])
+        provider_models = dict(values["provider_models"])
+        transcription_models = dict(values["transcription_models"])
+
+        for provider_id in PROVIDERS:
+            if not bool(api_from_env.get(provider_id, False)):
+                save_api_key(
+                    str(api_keys.get(provider_id) or "").strip(),
+                    provider_id=provider_id,
+                )
+
+        self.api_keys = load_api_keys()
+        self.settings.provider = str(values["provider"] or "gemini")
+        for provider_id, model in provider_models.items():
+            self.settings.set_model(provider_id, str(model or ""))
+        self.settings.transcription_provider = str(
+            values["transcription_provider"] or "auto"
+        )
+        for provider_id, model in transcription_models.items():
+            self.settings.set_transcription_model(provider_id, str(model or ""))
+        self.settings.cookie_file = str(values["cookie_file"] or "").strip()
+        self.settings.keep_download = bool(values["keep_download"])
         save_settings(self.settings)
 
-        self.model_combo.blockSignals(True)
-        if model and self.model_combo.findText(model) < 0:
-            self.model_combo.addItem(model)
-        if model:
-            self.model_combo.setCurrentText(model)
-        self.model_combo.blockSignals(False)
+        for provider_id in PROVIDERS:
+            cached = list(self.models_by_provider.get(provider_id, []))
+            model = self.settings.get_model(provider_id)
+            if model and model not in cached:
+                cached.insert(0, model)
+            self.models_by_provider[provider_id] = cached or provider_fallback_models(provider_id)
 
         self.keep_switch.blockSignals(True)
-        self.keep_switch.setChecked(keep_download)
+        self.keep_switch.setChecked(self.settings.keep_download)
         self.keep_switch.blockSignals(False)
-        self._refresh_config_labels()
 
-        if requested_theme in {"light", "dark"} and requested_theme != self.theme:
-            self.theme = requested_theme
-            self.qt_settings.setValue("theme", self.theme)
-            self.theme_toggle.setChecked(self.theme == "dark")
-            self._animate_theme_transition()
-
+        self._sync_provider_controls()
         self._toast("设置已保存", "success")
+
+    def _provider_changed(self, index: int) -> None:
+        provider_id = str(self.provider_combo.itemData(index) or "").strip()
+        if not provider_id or provider_id not in PROVIDERS:
+            return
+        if provider_id == self.settings.provider:
+            return
+
+        # Persist the outgoing provider's current model before switching.
+        old_provider = self.settings.provider
+        old_model = self.model_combo.currentText().strip()
+        if old_model:
+            self.settings.set_model(old_provider, old_model)
+            current_items = [
+                self.model_combo.itemText(i)
+                for i in range(self.model_combo.count())
+                if self.model_combo.itemText(i).strip()
+            ]
+            self.models_by_provider[old_provider] = current_items
+
+        self.settings.provider = provider_id
+        save_settings(self.settings)
+        self._sync_provider_controls()
+        self._set_status(f"已切换到 {provider_display_name(provider_id)}")
 
     def _model_changed(self, value: str) -> None:
         value = value.strip()
         if not value:
             return
-        self.settings.model = value
+        provider_id = self.settings.provider
+        self.settings.set_model(provider_id, value)
+        if value not in self.models_by_provider.get(provider_id, []):
+            self.models_by_provider.setdefault(provider_id, []).insert(0, value)
         save_settings(self.settings)
 
     def refresh_models(self) -> None:
-        self.api_key = load_api_key()
-        if not self.api_key:
-            self._toast("请先在设置中配置 Gemini API Key。", "warning")
+        provider_id = self.settings.provider
+        api_key = load_api_key(provider_id)
+        if not api_key:
+            self._toast(
+                f"请先在设置中配置 {provider_display_name(provider_id)} API Key。",
+                "warning",
+            )
             self.open_settings()
             return
         if self.model_thread and self.model_thread.isRunning():
             return
 
         self.refresh_models_button.setEnabled(False)
-        self._set_status("正在刷新模型…")
-        self.model_thread = ModelRefreshThread(self.api_key, self)
+        self.provider_combo.setEnabled(False)
+        self._set_status(f"正在刷新 {provider_display_name(provider_id)} 模型…")
+        self.model_thread = ModelRefreshThread(provider_id, api_key, self)
         self.model_thread.models_ready.connect(self._apply_models)
         self.model_thread.failed.connect(self._model_refresh_failed)
         self.model_thread.finished.connect(self._finish_model_refresh)
@@ -1378,26 +1509,48 @@ class MainWindow(QMainWindow):
 
     def _finish_model_refresh(self) -> None:
         self.refresh_models_button.setEnabled(True)
+        self.provider_combo.setEnabled(True)
         self.model_thread = None
 
-    def _apply_models(self, models: list[str]) -> None:
-        current = self.settings.model
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        self.model_combo.addItems(models)
-        if current in models:
-            self.model_combo.setCurrentText(current)
-        else:
-            self.model_combo.setCurrentIndex(0)
-            self.settings.model = self.model_combo.currentText()
-            save_settings(self.settings)
-        self.model_combo.blockSignals(False)
-        self._set_status(f"模型刷新完成 · {len(models)} 个")
-        self._toast(f"已刷新 {len(models)} 个可用模型", "success")
+    def _apply_models(self, provider_id: str, models: list[str]) -> None:
+        models = list(dict.fromkeys(
+            str(model).strip()
+            for model in models
+            if str(model).strip()
+        ))
+        self.models_by_provider[provider_id] = models
 
-    def _model_refresh_failed(self, message: str) -> None:
+        # Cache only successful non-empty refreshes. The next application start
+        # will restore these lists without requiring another API request.
+        save_model_cache(provider_id, models)
+
+        current = self.settings.get_model(provider_id)
+
+        if provider_id == self.settings.provider:
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            if current in models:
+                self.model_combo.setCurrentText(current)
+            elif models:
+                self.model_combo.setCurrentIndex(0)
+                self.settings.set_model(provider_id, self.model_combo.currentText())
+                save_settings(self.settings)
+            self.model_combo.blockSignals(False)
+
+        self._set_status(f"模型刷新完成 · {len(models)} 个")
+        self._toast(
+            f"{provider_display_name(provider_id)} 已刷新 {len(models)} 个可用模型",
+            "success",
+        )
+
+    def _model_refresh_failed(self, provider_id: str, message: str) -> None:
         self._set_status("模型刷新失败")
-        self._toast(f"模型列表刷新失败：{message}", "warning", 4200)
+        self._toast(
+            f"{provider_display_name(provider_id)} 模型列表刷新失败：{message}",
+            "warning",
+            4200,
+        )
 
     def _keep_download_changed(self, checked: bool) -> None:
         self.settings.keep_download = bool(checked)
@@ -1664,9 +1817,23 @@ class MainWindow(QMainWindow):
         if self.processing_thread and self.processing_thread.isRunning():
             return
 
-        self.api_key = load_api_key()
-        if not self.api_key:
-            self._toast("开始任务前需要先配置 Gemini API Key。", "warning")
+        provider_id = self.settings.provider
+        provider_name = provider_display_name(provider_id)
+        self.api_keys = load_api_keys()
+
+        if not self.api_keys.get(provider_id, "").strip():
+            self._toast(f"开始任务前需要先配置 {provider_name} API Key。", "warning")
+            self.open_settings()
+            return
+
+        try:
+            validate_provider_configuration(
+                provider_id,
+                self.api_keys,
+                self.settings.transcription_provider,
+            )
+        except ProviderError as exc:
+            self._toast(str(exc), "warning", 4600)
             self.open_settings()
             return
 
@@ -1675,9 +1842,8 @@ class MainWindow(QMainWindow):
         if not url and not local:
             self._toast("请粘贴 B 站链接，或选择本地音视频文件。", "warning")
             return
-        # 新任务开始，退出阅读优先状态
-        self.leave_result_mode()
 
+        self.leave_result_mode()
         self.focus_button.setEnabled(False)
 
         self.result_markdown = ""
@@ -1692,16 +1858,20 @@ class MainWindow(QMainWindow):
 
         self.latest_log.parent.mkdir(parents=True, exist_ok=True)
         self.latest_log.write_text(
-            f"=== {datetime.now().isoformat(timespec='seconds')} ===\n",
+            f"=== {datetime.now().isoformat(timespec='seconds')} ===\n"
+            f"provider={provider_id} model={self.settings.get_model(provider_id)}\n"
+            f"transcription={self._transcription_route_name()}\n",
             encoding="utf-8",
         )
 
-        # Snapshot the UI settings so changing widgets cannot mutate an active job.
         self.processing_thread = ProcessingThread(
             url=url,
             local_file=local,
-            api_key=self.api_key,
-            model=self.settings.model,
+            provider_id=provider_id,
+            api_keys=dict(self.api_keys),
+            provider_models=dict(self.settings.provider_models),
+            transcription_provider=self.settings.transcription_provider,
+            transcription_models=dict(self.settings.transcription_models),
             cookie_file=self.settings.cookie_file,
             keep_download=bool(self.settings.keep_download),
             latest_log=self.latest_log,
@@ -1715,11 +1885,8 @@ class MainWindow(QMainWindow):
         self.processing_thread.finished.connect(self.processing_thread.deleteLater)
         self.processing_thread.start()
 
-    # ------------------------------------------------------------------
-    # Rich live processing feedback
-    # ------------------------------------------------------------------
-
     @staticmethod
+
     def _format_clock(seconds: float) -> str:
         seconds = max(0, int(seconds))
         minutes, sec = divmod(seconds, 60)
@@ -1750,6 +1917,53 @@ class MainWindow(QMainWindow):
             value /= 1024
         return f"{size} B"
 
+    def _active_provider_name(self) -> str:
+        return provider_display_name(self.settings.provider)
+
+    def _transcription_provider_id(self) -> str:
+        provider_id = self.settings.provider
+        spec = PROVIDERS[provider_id]
+
+        if spec.supports_direct_audio or spec.supports_transcription:
+            return provider_id
+
+        requested = self.settings.transcription_provider
+        if requested in {"gemini", "openai"}:
+            return requested
+
+        # Mirror ai.manager auto resolution: Gemini first, then OpenAI.
+        keys = self.api_keys or load_api_keys()
+        if keys.get("gemini", "").strip():
+            return "gemini"
+        if keys.get("openai", "").strip():
+            return "openai"
+        return ""
+
+    def _transcription_provider_name(self) -> str:
+        provider_id = self._transcription_provider_id()
+        return provider_display_name(provider_id) if provider_id else "音频转写服务"
+
+    def _transcription_model_name(self) -> str:
+        provider_id = self._transcription_provider_id()
+        if not provider_id:
+            return "未选择转写模型"
+        return self.settings.get_transcription_model(provider_id)
+
+    def _transcription_route_name(self) -> str:
+        provider_id = self._transcription_provider_id()
+        if not provider_id:
+            return "音频转写服务未配置"
+        return (
+            f"{provider_display_name(provider_id)} · "
+            f"{self.settings.get_transcription_model(provider_id)}"
+        )
+
+    def _activity_prepare_label(self) -> str:
+        provider_id = self.settings.provider
+        if provider_id == "gemini":
+            return "上传 / 处理 Gemini 音频"
+        return f"音频转写 · {self._transcription_route_name()}"
+
     def _start_activity(self, *, url: str, local_file: str) -> None:
         now = time.monotonic()
 
@@ -1766,7 +1980,10 @@ class MainWindow(QMainWindow):
         self.indeterminate_animation.stop()
         self.activity_media_info = {}
         self.activity_failed_stage = None
-        self.activity_model_desc = str(self.settings.model or "").strip() or "Gemini"
+
+        provider_name = self._active_provider_name()
+        model = self.settings.get_model(self.settings.provider)
+        self.activity_model_desc = f"{provider_name} · {model}"
 
         if url:
             self.activity_source_kind = "bilibili"
@@ -1783,7 +2000,7 @@ class MainWindow(QMainWindow):
             except OSError:
                 self.activity_source_desc = name
 
-        self.activity_title.setText("任务处理中")
+        self.activity_title.setText(f"{provider_name} 任务处理中")
         self.activity_elapsed_label.setText("总耗时 00:00")
         self.activity_hint_label.setText("正在准备媒体，请稍候…")
         self.activity_panel_expanded = False
@@ -1795,19 +2012,20 @@ class MainWindow(QMainWindow):
         self.activity_pulse.setProperty("bright", False)
         self.activity_pulse.style().unpolish(self.activity_pulse)
         self.activity_pulse.style().polish(self.activity_pulse)
-
         self.activity_timer.start()
+
 
     def _stage_from_progress(self, percent: int, text: str) -> str:
         if percent >= 100 or "总结完成" in text:
             return "complete"
-        if percent >= 72 or ("正在总结视频" in text and "完成" not in text):
+        if percent >= 72 or "正在总结视频" in text or "总结转写文本" in text:
             return "inference"
-        if percent >= 55 or "Gemini" in text:
+        if percent >= 54:
             return "upload"
         if percent >= 38:
             return "normalize"
         return "source"
+
 
     def _transition_activity(self, new_stage: str) -> None:
         if not self.activity_running:
@@ -1815,24 +2033,29 @@ class MainWindow(QMainWindow):
 
         now = time.monotonic()
         old_stage = self.activity_stage
-
         if new_stage == old_stage:
             return
 
         if old_stage in {"source", "normalize", "upload", "inference"}:
             elapsed = max(0.0, now - self.activity_stage_started)
             self.activity_stage_durations[old_stage] = (
-                    self.activity_stage_durations.get(old_stage, 0.0) + elapsed
+                self.activity_stage_durations.get(old_stage, 0.0) + elapsed
             )
 
         self.activity_stage = new_stage
         self.activity_stage_started = now
+        provider_name = self._active_provider_name()
 
         if new_stage == "upload":
-            self.activity_title.setText("Gemini 正在准备音频")
-            self.activity_hint_label.setText(
-                "音频正在上传或由 Gemini Files API 处理，完成后会自动进入模型分析。"
-            )
+            self.activity_title.setText("正在准备 AI 输入")
+            if self.settings.provider == "gemini":
+                self.activity_hint_label.setText(
+                    "音频正在上传或由 Google Gemini 处理，完成后会自动进入模型分析。"
+                )
+            else:
+                self.activity_hint_label.setText(
+                    f"正在使用 {self._transcription_route_name()} 将音频转写为文本，完成后会提交给 {provider_name}。"
+                )
 
         elif new_stage == "inference":
             self.activity_inference_started = now
@@ -1845,9 +2068,9 @@ class MainWindow(QMainWindow):
 
             self.indeterminate_animation.stop()
             self.indeterminate_animation.start()
-            self.activity_title.setText("Gemini 正在生成视频笔记")
+            self.activity_title.setText(f"{provider_name} 正在生成视频笔记")
             self.activity_hint_label.setText(
-                "已向模型提交完整音频，正在等待 Gemini 返回总结。程序仍在正常运行。"
+                f"已向 {provider_name} 提交内容，正在等待完整总结。程序仍在正常运行。"
             )
 
         elif new_stage == "complete":
@@ -1855,6 +2078,7 @@ class MainWindow(QMainWindow):
             return
 
         self._render_activity_timeline(now)
+
 
     def _complete_activity(self, *, success: bool) -> None:
         now = time.monotonic()
@@ -1917,7 +2141,9 @@ class MainWindow(QMainWindow):
         self._refresh_activity_info()
 
     def _refresh_activity_info(self) -> None:
-        model = self.activity_model_desc or str(self.settings.model or "").strip() or "Gemini"
+        provider_name = self._active_provider_name()
+        fallback_model = self.settings.get_model(self.settings.provider)
+        model = self.activity_model_desc or f"{provider_name} · {fallback_model}"
         source = self.activity_source_desc or "等待输入"
 
         prepared_bytes = int(self.activity_media_info.get("prepared_bytes", 0) or 0)
@@ -1934,6 +2160,19 @@ class MainWindow(QMainWindow):
         self.activity_source_value.setText(source)
         self.activity_audio_value.setText(audio_text)
 
+        current_spec = PROVIDERS[self.settings.provider]
+        if current_spec.supports_direct_audio:
+            self.activity_route_label.setText(
+                "音频路径：当前总结模型直接处理音频，无需独立转写步骤。"
+            )
+        else:
+            self.activity_route_label.setText(
+                f"转写模型：{self._transcription_route_name()}  →  "
+                f"总结模型：{self._active_provider_name()} · "
+                f"{self.settings.get_model(self.settings.provider)}"
+            )
+
+
     def _current_stage_elapsed(self, stage: str, now: float) -> float:
         value = float(self.activity_stage_durations.get(stage, 0.0))
         if self.activity_running and self.activity_stage == stage:
@@ -1945,29 +2184,26 @@ class MainWindow(QMainWindow):
             return
 
         now = time.monotonic() if now is None else now
-
         source_name = (
             "获取 B站音频"
             if self.activity_source_kind == "bilibili"
             else "读取本地媒体"
         )
         self.activity_stage_name_labels["source"].setText(source_name)
-
-        stages = [
-            ("source", source_name),
-            ("normalize", "音频预处理"),
-            ("upload", "上传 / 处理 Gemini 音频"),
-            ("inference", "AI 生成结构化摘要"),
-        ]
-
-        order = ["source", "normalize", "upload", "inference"]
-        current_index = (
-            order.index(self.activity_stage)
-            if self.activity_stage in order
-            else len(order)
+        self.activity_stage_name_labels["normalize"].setText("音频预处理")
+        self.activity_stage_name_labels["upload"].setText(self._activity_prepare_label())
+        self.activity_stage_name_labels["inference"].setText(
+            f"{self._active_provider_name()} 生成摘要"
         )
 
-        for index, (key, _label) in enumerate(stages):
+        stages = ["source", "normalize", "upload", "inference"]
+        current_index = (
+            stages.index(self.activity_stage)
+            if self.activity_stage in stages
+            else len(stages)
+        )
+
+        for index, key in enumerate(stages):
             duration = self._current_stage_elapsed(key, now)
 
             if key == self.activity_failed_stage:
@@ -1991,6 +2227,7 @@ class MainWindow(QMainWindow):
 
             self.activity_stage_icon_labels[key].setText(icon)
             self.activity_stage_time_labels[key].setText(timing)
+
 
     def _position_activity_panel(self) -> None:
         """Place the floating task-status card under the dropdown trigger.
@@ -2040,21 +2277,17 @@ class MainWindow(QMainWindow):
             self.activity_toggle_button.setText("查看任务状态  ▾")
 
     def _activity_hint_for_wait(self, seconds: float) -> str:
+        provider_name = self._active_provider_name()
         if seconds < 10:
-            return "Gemini 已接收生成请求，正在准备响应…"
+            return f"{provider_name} 已接收生成请求，正在准备响应…"
         if seconds < 30:
-            return "正在等待 Gemini 返回完整总结。程序仍在正常运行，请稍候…"
+            return f"正在等待 {provider_name} 返回完整总结。程序仍在正常运行，请稍候…"
         if seconds < 60:
             return "长视频分析通常需要更多时间；当前请求仍在处理中。"
         if seconds < 120:
-            return (
-                "已等待较长时间。模型负载和网络状况可能影响响应速度，"
-                "请保持程序开启。"
-            )
-        return (
-            "Gemini 请求仍在等待响应。若服务最终返回超时或错误，"
-            "程序会明确提示；当前无需重复点击。"
-        )
+            return "已等待较长时间。模型负载和网络状况可能影响响应速度，请保持程序开启。"
+        return f"{provider_name} 请求仍在等待响应。若服务最终返回超时或错误，程序会明确提示；当前无需重复点击。"
+
 
     def _tick_activity(self) -> None:
         if not self.activity_running:
@@ -2062,39 +2295,33 @@ class MainWindow(QMainWindow):
 
         now = time.monotonic()
         self.activity_tick_count += 1
-
         total = max(0.0, now - self.activity_task_started)
-        self.activity_elapsed_label.setText(
-            f"总耗时 {self._format_clock(total)}"
-        )
+        self.activity_elapsed_label.setText(f"总耗时 {self._format_clock(total)}")
 
-        # Gentle breathing dot: two states, updated only twice per second.
         if self.activity_tick_count % 2 == 0:
             self.activity_pulse_bright = not self.activity_pulse_bright
-            self.activity_pulse.setProperty(
-                "bright",
-                self.activity_pulse_bright,
-            )
+            self.activity_pulse.setProperty("bright", self.activity_pulse_bright)
             self.activity_pulse.style().unpolish(self.activity_pulse)
             self.activity_pulse.style().polish(self.activity_pulse)
 
         if self.activity_stage == "inference":
             wait = max(0.0, now - self.activity_inference_started)
             self.activity_hint_label.setText(
-                f"AI 已等待 {self._format_clock(wait)} · "
-                f"{self._activity_hint_for_wait(wait)}"
+                f"AI 已等待 {self._format_clock(wait)} · {self._activity_hint_for_wait(wait)}"
             )
-
-            # The indeterminate bars are animated continuously by
-            # QVariantAnimation; this timer only updates text/elapsed time.
-
         elif self.activity_stage == "upload":
-            self.activity_hint_label.setText(
-                "Gemini 正在接收或处理上传音频；这一阶段完成后会自动进入 AI 分析。"
-            )
+            if self.settings.provider == "gemini":
+                self.activity_hint_label.setText(
+                    "Google Gemini 正在接收或处理上传音频；完成后会自动进入 AI 分析。"
+                )
+            else:
+                self.activity_hint_label.setText(
+                    f"{self._transcription_route_name()} 正在转写音频；完成后会自动进入 AI 总结。"
+                )
             self._sync_activity_wait_fill()
 
         self._render_activity_timeline(now)
+
 
     def _on_indeterminate_phase(self, value) -> None:
         if not self.indeterminate_mode:

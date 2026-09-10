@@ -22,9 +22,14 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QStackedWidget,
+    QScrollArea,
 )
 
-from ui_widgets import APP_FONT_FAMILY
+from ui_widgets import APP_FONT_FAMILY, SmartComboBox
+from ai.catalog import PROVIDERS, provider_fallback_models, transcription_model_candidates
+from settings import api_key_from_env, model_cache_updated_at, save_model_cache
+from workers import ModelRefreshThread
 
 
 @dataclass(frozen=True)
@@ -36,72 +41,39 @@ class FriendlyError:
 
 
 def classify_error(raw: str) -> FriendlyError:
-    """Convert technical backend exceptions into concise user-facing guidance."""
+    """Convert provider/backend exceptions into concise user-facing guidance."""
     raw = (raw or "未知错误").strip()
     low = raw.lower()
 
+    provider = "AI 服务"
+    # Prefer the actual provider name when compatibility-layer wording contains
+    # multiple vendor names (for example "DeepSeek ... OpenAI compatible").
+    if "deepseek" in low:
+        provider = "DeepSeek"
+    elif "openai" in low:
+        provider = "OpenAI"
+    elif "gemini" in low or "google" in low:
+        provider = "Google Gemini"
+
     if "503" in low or "high demand" in low or "unavailable" in low:
-        return FriendlyError(
-            "Gemini 服务暂时繁忙",
-            "当前模型暂时无法处理这次请求，通常是服务端短时负载较高。",
-            "稍后重新尝试，或在设置中切换其他可用模型。",
-            raw,
-        )
-    if "429" in low or "resource_exhausted" in low or "quota" in low:
-        return FriendlyError(
-            "Gemini 配额暂时不可用",
-            "当前 API Key 可能达到请求频率或配额限制。",
-            "稍后再试，并检查对应 Gemini API 项目的配额状态。",
-            raw,
-        )
-    if "401" in low or "403" in low or "api key" in low or "permission" in low:
-        return FriendlyError(
-            "Gemini API Key 无法使用",
-            "API Key 可能无效、过期，或当前项目没有相应模型权限。",
-            "打开设置重新检查 API Key，然后刷新可用模型。",
-            raw,
-        )
+        return FriendlyError(f"{provider} 暂时繁忙", "当前模型暂时无法处理这次请求，通常是服务端短时负载较高。", "稍后重新尝试，或切换同一服务商下的其他可用模型。", raw)
+    if "429" in low or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+        return FriendlyError(f"{provider} 配额暂时不可用", "当前 API Key 可能达到请求频率、余额或配额限制。", "稍后再试，并检查该服务商控制台中的额度和计费状态。", raw)
+    if "401" in low or "403" in low or "api key" in low or "permission" in low or "authentication" in low:
+        return FriendlyError(f"{provider} API Key 无法使用", "API Key 可能无效、过期，或当前账号没有所选模型的访问权限。", "打开设置检查当前服务商的 API Key，并刷新可用模型。", raw)
+    if "不能直接处理音频" in raw or "音频转写服务" in raw:
+        return FriendlyError("需要配置音频转写服务", "当前选择的总结模型不能直接接收音频，因此必须先把音频转成文字。", "在设置中配置 Google Gemini 或 OpenAI API Key，并选择其作为音频转写服务。", raw)
     if "412" in low or "request was banned" in low:
-        return FriendlyError(
-            "B 站暂时拒绝了访问",
-            "B 站访问策略阻止了本次音频获取，这不是 Gemini 错误。",
-            "更新 yt-dlp；若视频需要登录，请在设置中选择自己的 Cookie 文件，或稍后再试。",
-            raw,
-        )
+        return FriendlyError("B 站暂时拒绝了访问", "B 站访问策略阻止了本次音频获取，这不是 AI 模型错误。", "更新 yt-dlp；若视频需要登录，请在设置中选择自己的 Cookie 文件，或稍后再试。", raw)
     if "ffmpeg" in low or "音轨" in raw or "转换失败" in raw:
-        return FriendlyError(
-            "音频预处理失败",
-            "FFmpeg 没能从当前媒体中生成可供 Gemini 使用的音频。",
-            "确认文件包含可读取的音轨；必要时查看下载日志中的技术信息。",
-            raw,
-        )
+        return FriendlyError("音频预处理失败", "FFmpeg 没能从当前媒体中生成可供 AI 使用的音频。", "确认文件包含可读取的音轨；必要时查看下载日志中的技术信息。", raw)
     if "no such file or directory" in low or "filenotfound" in low:
-        return FriendlyError(
-            "运行环境缺少所需文件",
-            "程序访问某个本地文件或环境资源时发现它不存在。",
-            "检查当前 Python/Conda 环境、Cookie 路径和相关依赖配置，再重新尝试。",
-            raw,
-        )
-    if "gemini" in low:
-        return FriendlyError(
-            "Gemini 处理失败",
-            "请求已经进入 Gemini 阶段，但服务没有正常返回总结结果。",
-            "可以稍后重试或切换模型；技术详情已保留供排查。",
-            raw,
-        )
+        return FriendlyError("运行环境缺少所需文件", "程序访问某个本地文件或环境资源时发现它不存在。", "检查当前 Python/Conda 环境、Cookie 路径和相关依赖配置，再重新尝试。", raw)
+    if "openai" in low or "deepseek" in low or "gemini" in low or "provider" in low:
+        return FriendlyError(f"{provider} 处理失败", "请求已经进入 AI 服务阶段，但没有正常返回总结结果。", "可以稍后重试或切换模型；技术详情已保留供排查。", raw)
     if "下载" in raw or "yt-dlp" in low or "b站" in low:
-        return FriendlyError(
-            "视频音频获取失败",
-            "程序没有成功获取这条视频的音频。",
-            "检查链接、网络和 Cookie 设置，并可打开下载日志查看详细原因。",
-            raw,
-        )
-    return FriendlyError(
-        "任务未能完成",
-        "处理过程中遇到了一个未预期的问题。",
-        "可以重新尝试；如果持续出现，请展开技术详情并查看下载日志。",
-        raw,
-    )
+        return FriendlyError("视频音频获取失败", "程序没有成功获取这条视频的音频。", "检查链接、网络和 Cookie 设置，并可打开下载日志查看详细原因。", raw)
+    return FriendlyError("任务未能完成", "处理过程中遇到了一个未预期的问题。", "可以重新尝试；如果持续出现，请展开技术详情并查看下载日志。", raw)
 
 
 class ToastWidget(QFrame):
@@ -346,15 +318,18 @@ class FriendlyErrorDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Centralized settings for credentials and persistent application options."""
+    """Multi-provider settings for credentials, models and audio transcription."""
 
     def __init__(
         self,
         *,
-        api_key: str,
+        provider_id: str,
+        api_keys: dict[str, str],
+        provider_models: dict[str, str],
+        models_by_provider: dict[str, list[str]],
+        transcription_provider: str,
+        transcription_models: dict[str, str],
         cookie_file: str,
-        model: str,
-        models: list[str],
         keep_download: bool,
         theme: str,
         parent=None,
@@ -362,110 +337,252 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.resize(650, 560)
-        self.setMinimumSize(590, 520)
-        self._api_from_env = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+        self.resize(740, 700)
+        self.setMinimumSize(660, 600)
+
+        self._api_edits: dict[str, QLineEdit] = {}
+        self._show_key_buttons: dict[str, QPushButton] = {}
+        self._model_combos: dict[str, SmartComboBox] = {}
+        self._model_refresh_buttons: dict[str, QPushButton] = {}
+        self._model_status_labels: dict[str, QLabel] = {}
+        self._api_from_env: dict[str, bool] = {}
+        self._model_refresh_thread: ModelRefreshThread | None = None
+        self._refreshing_provider_id = ""
+        self._models_by_provider = {
+            pid: list(values)
+            for pid, values in models_by_provider.items()
+        }
+        self._transcription_models = dict(transcription_models)
+        self._active_transcription_model_provider = ""
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(26, 24, 26, 22)
-        root.setSpacing(16)
+        root.setContentsMargins(28, 26, 28, 24)
+        root.setSpacing(18)
 
         title = QLabel("设置", self)
         title.setObjectName("settingsTitle")
-        subtitle = QLabel("统一管理 Gemini、Bilibili 和应用偏好。", self)
+        subtitle = QLabel("统一管理 AI 服务商、API Key、模型和 Bilibili 偏好。", self)
         subtitle.setObjectName("settingsMuted")
         root.addWidget(title)
         root.addWidget(subtitle)
 
-        gemini = self._section("Gemini")
-        gl = gemini.layout()
-        gl.addWidget(self._field_label("API Key"))
-        key_row = QHBoxLayout()
-        self.api_edit = QLineEdit(gemini)
-        self.api_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_edit.setText(api_key)
-        self.api_edit.setPlaceholderText("输入 Gemini API Key")
-        self.api_edit.setReadOnly(self._api_from_env)
-        key_row.addWidget(self.api_edit, 1)
-        self.show_key_button = QPushButton("显示", gemini)
-        self.show_key_button.setFixedWidth(72)
-        self.show_key_button.clicked.connect(self._toggle_key_visibility)
-        key_row.addWidget(self.show_key_button)
-        gl.addLayout(key_row)
+        # Scrollable body prevents DPI/small-screen layout compression.
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget(scroll)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 8, 0)
+        body_layout.setSpacing(16)
+        scroll.setWidget(body)
 
-        if self._api_from_env:
-            env_note = QLabel("当前由环境变量 GEMINI_API_KEY 提供，界面中不会覆盖它。", gemini)
-            env_note.setObjectName("settingsHint")
-            env_note.setWordWrap(True)
-            gl.addWidget(env_note)
+        ai_section = self._section("AI 服务")
+        ai_section.setMinimumHeight(455)
+        al = ai_section.layout()
 
-        gl.addWidget(self._field_label("默认模型"))
-        self.model_combo = QComboBox(gemini)
-        values = list(dict.fromkeys([m for m in models if m] + ([model] if model else [])))
-        self.model_combo.addItems(values)
-        if model:
-            self.model_combo.setCurrentText(model)
-        gl.addWidget(self.model_combo)
-        root.addWidget(gemini)
+        al.addWidget(self._field_label("当前服务商"))
+        self.provider_combo = SmartComboBox(ai_section, max_visible_items=8, max_popup_width=520)
+        self.provider_combo.setMinimumHeight(42)
+        for pid, spec in PROVIDERS.items():
+            self.provider_combo.addItem(spec.display_name, pid)
+        idx = self.provider_combo.findData(provider_id)
+        self.provider_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        al.addWidget(self.provider_combo)
+
+        self.provider_stack = QStackedWidget(ai_section)
+        self.provider_stack.setMinimumHeight(190)
+        for pid, spec in PROVIDERS.items():
+            page = QWidget(self.provider_stack)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 8, 0, 4)
+            page_layout.setSpacing(10)
+
+            page_layout.addWidget(self._field_label(f"{spec.display_name} API Key"))
+            key_row = QHBoxLayout()
+            key_row.setSpacing(10)
+            edit = QLineEdit(page)
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setText(str(api_keys.get(pid) or ""))
+            edit.setPlaceholderText(f"输入 {spec.display_name} API Key")
+            edit.setMinimumHeight(42)
+            from_env = api_key_from_env(pid)
+            edit.setReadOnly(from_env)
+            key_row.addWidget(edit, 1)
+
+            show = QPushButton("显示", page)
+            show.setFixedSize(76, 42)
+            show.clicked.connect(lambda _checked=False, p=pid: self._toggle_key_visibility(p))
+            key_row.addWidget(show)
+            page_layout.addLayout(key_row)
+
+            self._api_edits[pid] = edit
+            self._show_key_buttons[pid] = show
+            self._api_from_env[pid] = from_env
+
+            if from_env:
+                env_note = QLabel(
+                    f"当前由环境变量 {spec.env_var} 提供，界面不会覆盖它。",
+                    page,
+                )
+                env_note.setObjectName("settingsHint")
+                env_note.setWordWrap(True)
+                page_layout.addWidget(env_note)
+
+            page_layout.addWidget(self._field_label("默认总结模型"))
+
+            model_row = QHBoxLayout()
+            model_row.setSpacing(10)
+
+            combo = SmartComboBox(page, max_visible_items=9, max_popup_width=560)
+            # 设置页中的模型仅允许从已发现/已缓存列表选择。
+            combo.setEditable(False)
+            combo.setMinimumHeight(42)
+            candidates = list(dict.fromkeys(
+                [x for x in models_by_provider.get(pid, []) if x]
+                + provider_fallback_models(pid)
+                + ([provider_models.get(pid, "")] if provider_models.get(pid) else [])
+            ))
+            combo.addItems(candidates)
+            current_model = str(provider_models.get(pid) or spec.default_model)
+            combo.setCurrentText(current_model)
+            model_row.addWidget(combo, 1)
+
+            refresh = QPushButton("刷新模型", page)
+            refresh.setObjectName("settingsRefreshButton")
+            refresh.setFixedSize(92, 42)
+            refresh.setToolTip(f"从 {spec.display_name} 获取最新可用模型并缓存到本地")
+            refresh.clicked.connect(
+                lambda _checked=False, p=pid: self._refresh_provider_models(p)
+            )
+            model_row.addWidget(refresh)
+
+            page_layout.addLayout(model_row)
+            self._model_combos[pid] = combo
+            self._model_refresh_buttons[pid] = refresh
+
+            cache_status = QLabel("", page)
+            cache_status.setObjectName("settingsCacheHint")
+            cache_status.setWordWrap(True)
+            updated_at = model_cache_updated_at(pid)
+            if updated_at:
+                cache_status.setText("已载入本地模型缓存，可按需刷新。")
+            else:
+                cache_status.setText("当前为内置模型列表；刷新成功后会自动缓存到本地。")
+            page_layout.addWidget(cache_status)
+            self._model_status_labels[pid] = cache_status
+
+            note = QLabel(spec.notes, page)
+            note.setObjectName("settingsHint")
+            note.setWordWrap(True)
+            page_layout.addWidget(note)
+            page_layout.addStretch(1)
+
+            self.provider_stack.addWidget(page)
+
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self._provider_changed(self.provider_combo.currentIndex())
+        al.addWidget(self.provider_stack)
+
+        al.addWidget(self._field_label("音频转写服务"))
+        self.transcription_combo = SmartComboBox(ai_section, max_visible_items=6, max_popup_width=420)
+        self.transcription_combo.setMinimumHeight(42)
+        self.transcription_combo.addItem("自动选择", "auto")
+        self.transcription_combo.addItem("Google Gemini", "gemini")
+        self.transcription_combo.addItem("OpenAI", "openai")
+        trans_idx = self.transcription_combo.findData(transcription_provider)
+        self.transcription_combo.setCurrentIndex(trans_idx if trans_idx >= 0 else 0)
+        al.addWidget(self.transcription_combo)
+
+        al.addWidget(self._field_label("音频转写模型"))
+        self.transcription_model_combo = SmartComboBox(
+            ai_section,
+            max_visible_items=9,
+            max_popup_width=560,
+        )
+        self.transcription_model_combo.setMinimumHeight(42)
+        al.addWidget(self.transcription_model_combo)
+
+        self.transcription_resolution_label = QLabel("", ai_section)
+        self.transcription_resolution_label.setObjectName("settingsHint")
+        self.transcription_resolution_label.setWordWrap(True)
+        al.addWidget(self.transcription_resolution_label)
+
+        trans_note = QLabel(
+            "仅当所选总结服务商不能直接处理音频时使用。DeepSeek 需要先通过 Gemini 或 OpenAI 转写；"
+            "自动模式优先使用已配置的 Gemini，其次 OpenAI。转写模型与总结模型独立保存。",
+            ai_section,
+        )
+        trans_note.setObjectName("settingsHint")
+        trans_note.setWordWrap(True)
+        al.addWidget(trans_note)
+
+        self.transcription_combo.currentIndexChanged.connect(
+            self._refresh_transcription_controls
+        )
+        self.transcription_model_combo.currentTextChanged.connect(
+            self._transcription_model_changed
+        )
+        for edit in self._api_edits.values():
+            edit.textChanged.connect(self._refresh_transcription_controls)
+
+        self._refresh_transcription_controls()
+        body_layout.addWidget(ai_section)
 
         bili = self._section("Bilibili")
+        bili.setMinimumHeight(132)
         bl = bili.layout()
         bl.addWidget(self._field_label("Cookie 文件（可选）"))
         cookie_row = QHBoxLayout()
+        cookie_row.setSpacing(10)
         self.cookie_edit = QLineEdit(bili)
         self.cookie_edit.setReadOnly(True)
         self.cookie_edit.setText(cookie_file)
         self.cookie_edit.setPlaceholderText("未使用 Cookie")
+        self.cookie_edit.setMinimumHeight(42)
         cookie_row.addWidget(self.cookie_edit, 1)
         choose = QPushButton("选择", bili)
+        choose.setFixedHeight(42)
         choose.clicked.connect(self._choose_cookie)
         cookie_row.addWidget(choose)
         clear = QPushButton("清除", bili)
+        clear.setFixedHeight(42)
         clear.clicked.connect(self.cookie_edit.clear)
         cookie_row.addWidget(clear)
         bl.addLayout(cookie_row)
-        root.addWidget(bili)
+        body_layout.addWidget(bili)
 
         app_section = self._section("应用")
-        al = app_section.layout()
+        app_section.setMinimumHeight(86)
+        app_layout = app_section.layout()
         self.keep_check = QCheckBox("保留从 B 站下载的原始音频", app_section)
         self.keep_check.setChecked(bool(keep_download))
-        al.addWidget(self.keep_check)
+        self.keep_check.setMinimumHeight(32)
+        app_layout.addWidget(self.keep_check)
+        body_layout.addWidget(app_section)
+        body_layout.addStretch(1)
+        root.addWidget(scroll, 1)
 
-        theme_row = QHBoxLayout()
-        theme_label = QLabel("外观主题", app_section)
-        theme_label.setObjectName("settingsFieldLabel")
-        theme_row.addWidget(theme_label)
-        theme_row.addStretch(1)
-        self.theme_combo = QComboBox(app_section)
-        self.theme_combo.addItem("浅色", "light")
-        self.theme_combo.addItem("深色", "dark")
-        index = self.theme_combo.findData(theme)
-        self.theme_combo.setCurrentIndex(max(0, index))
-        self.theme_combo.setFixedWidth(150)
-        theme_row.addWidget(self.theme_combo)
-        al.addLayout(theme_row)
-        root.addWidget(app_section)
-
-        root.addStretch(1)
         footer = QHBoxLayout()
         footer.addStretch(1)
-        cancel = QPushButton("取消", self)
-        cancel.clicked.connect(self.reject)
-        footer.addWidget(cancel)
-        save = QPushButton("保存设置", self)
-        save.setObjectName("settingsPrimaryButton")
-        save.clicked.connect(self.accept)
-        footer.addWidget(save)
+        self.cancel_button = QPushButton("取消", self)
+        self.cancel_button.clicked.connect(self.reject)
+        footer.addWidget(self.cancel_button)
+
+        self.save_button = QPushButton("保存设置", self)
+        self.save_button.setObjectName("settingsPrimaryButton")
+        self.save_button.clicked.connect(self.accept)
+        footer.addWidget(self.save_button)
         root.addLayout(footer)
+
         self._apply_style(theme)
 
     def _section(self, title: str) -> QFrame:
         frame = QFrame(self)
         frame.setObjectName("settingsSection")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(9)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(11)
         label = QLabel(title, frame)
         label.setObjectName("settingsSectionTitle")
         layout.addWidget(label)
@@ -474,15 +591,218 @@ class SettingsDialog(QDialog):
     def _field_label(self, text: str) -> QLabel:
         label = QLabel(text, self)
         label.setObjectName("settingsFieldLabel")
+        label.setMinimumHeight(18)
         return label
 
-    def _toggle_key_visibility(self) -> None:
-        if self.api_edit.echoMode() == QLineEdit.EchoMode.Password:
-            self.api_edit.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.show_key_button.setText("隐藏")
+    def _provider_changed(self, index: int) -> None:
+        if 0 <= index < self.provider_stack.count():
+            self.provider_stack.setCurrentIndex(index)
+
+    def _toggle_key_visibility(self, provider_id: str) -> None:
+        edit = self._api_edits[provider_id]
+        button = self._show_key_buttons[provider_id]
+        if edit.echoMode() == QLineEdit.EchoMode.Password:
+            edit.setEchoMode(QLineEdit.EchoMode.Normal)
+            button.setText("隐藏")
         else:
-            self.api_edit.setEchoMode(QLineEdit.EchoMode.Password)
-            self.show_key_button.setText("显示")
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            button.setText("显示")
+
+    def _refresh_provider_models(self, provider_id: str) -> None:
+        provider_id = (provider_id or "").strip().lower()
+        if provider_id not in PROVIDERS:
+            return
+
+        if self._model_refresh_thread and self._model_refresh_thread.isRunning():
+            return
+
+        edit = self._api_edits.get(provider_id)
+        api_key = edit.text().strip() if edit is not None else ""
+        status = self._model_status_labels.get(provider_id)
+
+        if not api_key:
+            if status is not None:
+                status.setText("请先填写该服务商的 API Key，再刷新模型列表。")
+            return
+
+        self._refreshing_provider_id = provider_id
+        button = self._model_refresh_buttons.get(provider_id)
+        if button is not None:
+            button.setEnabled(False)
+            button.setText("刷新中…")
+
+        # Avoid closing/destroying the dialog while its QThread is running.
+        if hasattr(self, "save_button"):
+            self.save_button.setEnabled(False)
+        if hasattr(self, "cancel_button"):
+            self.cancel_button.setEnabled(False)
+
+        if status is not None:
+            status.setText(
+                f"正在从 {PROVIDERS[provider_id].display_name} 获取最新模型列表…"
+            )
+
+        thread = ModelRefreshThread(provider_id, api_key, self)
+        self._model_refresh_thread = thread
+        thread.models_ready.connect(self._settings_models_ready)
+        thread.failed.connect(self._settings_models_failed)
+        thread.finished.connect(self._settings_models_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _settings_models_ready(self, provider_id: str, models: list[str]) -> None:
+        models = list(dict.fromkeys(
+            str(model).strip()
+            for model in models
+            if str(model).strip()
+        ))
+        if not models:
+            self._settings_models_failed(
+                provider_id,
+                "服务商没有返回可用模型。",
+            )
+            return
+
+        self._models_by_provider[provider_id] = list(models)
+        save_model_cache(provider_id, models)
+
+        combo = self._model_combos.get(provider_id)
+        if combo is not None:
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(models)
+
+            if current and current in models:
+                combo.setCurrentText(current)
+            elif combo.count():
+                combo.setCurrentIndex(0)
+
+            combo.blockSignals(False)
+
+        status = self._model_status_labels.get(provider_id)
+        if status is not None:
+            status.setText(
+                f"已刷新 {len(models)} 个模型，并缓存到本地。下次启动无需再次刷新。"
+            )
+
+        # A refreshed Gemini list may also change the selectable transcription
+        # models, so update that selector immediately.
+        if provider_id in {"gemini", "openai"}:
+            self._refresh_transcription_controls()
+
+    def _settings_models_failed(self, provider_id: str, message: str) -> None:
+        status = self._model_status_labels.get(provider_id)
+        if status is not None:
+            status.setText(
+                f"刷新失败：{str(message or '未知错误').strip()}。"
+                " 已保留原有本地缓存。"
+            )
+
+    def _settings_models_finished(self) -> None:
+        provider_id = self._refreshing_provider_id
+        button = self._model_refresh_buttons.get(provider_id)
+        if button is not None:
+            button.setEnabled(True)
+            button.setText("刷新模型")
+
+        if hasattr(self, "save_button"):
+            self.save_button.setEnabled(True)
+        if hasattr(self, "cancel_button"):
+            self.cancel_button.setEnabled(True)
+
+        self._model_refresh_thread = None
+        self._refreshing_provider_id = ""
+
+    def _resolved_transcription_provider(self) -> str:
+        requested = str(self.transcription_combo.currentData() or "auto")
+        if requested in {"gemini", "openai"}:
+            return requested
+
+        # Must mirror ai.manager._resolve_transcriber_id().
+        if self._api_edits.get("gemini") and self._api_edits["gemini"].text().strip():
+            return "gemini"
+        if self._api_edits.get("openai") and self._api_edits["openai"].text().strip():
+            return "openai"
+        return ""
+
+    def _save_visible_transcription_model(self) -> None:
+        provider_id = self._active_transcription_model_provider
+        if not provider_id:
+            return
+        model = self.transcription_model_combo.currentText().strip()
+        if model:
+            self._transcription_models[provider_id] = model
+
+    def _transcription_model_changed(self, text: str) -> None:
+        provider_id = self._active_transcription_model_provider
+        text = str(text or "").strip()
+        if provider_id and text:
+            self._transcription_models[provider_id] = text
+            self._update_transcription_resolution_label()
+
+    def _refresh_transcription_controls(self, *_args) -> None:
+        # Preserve the model selected for the previously visible transcriber.
+        if hasattr(self, "transcription_model_combo"):
+            self._save_visible_transcription_model()
+
+        provider_id = self._resolved_transcription_provider()
+        self._active_transcription_model_provider = provider_id
+
+        combo = self.transcription_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+
+        if not provider_id:
+            combo.addItem("请先配置 Gemini 或 OpenAI API Key")
+            combo.setEnabled(False)
+            combo.blockSignals(False)
+            self._update_transcription_resolution_label()
+            return
+
+        available = self._models_by_provider.get(provider_id, [])
+        candidates = transcription_model_candidates(provider_id, available)
+
+        saved = str(self._transcription_models.get(provider_id) or "").strip()
+        if saved and saved not in candidates:
+            candidates.insert(0, saved)
+
+        if not candidates:
+            candidates = [saved] if saved else []
+
+        combo.addItems([x for x in candidates if x])
+
+        if saved:
+            combo.setCurrentText(saved)
+        elif combo.count():
+            self._transcription_models[provider_id] = combo.itemText(0)
+            combo.setCurrentIndex(0)
+
+        combo.setEnabled(combo.count() > 0)
+        combo.blockSignals(False)
+        self._update_transcription_resolution_label()
+
+    def _update_transcription_resolution_label(self) -> None:
+        provider_id = self._active_transcription_model_provider
+        requested = str(self.transcription_combo.currentData() or "auto")
+
+        if not provider_id:
+            self.transcription_resolution_label.setText(
+                "当前没有可用的音频转写服务。请先配置 Google Gemini 或 OpenAI API Key。"
+            )
+            return
+
+        provider_name = PROVIDERS[provider_id].display_name
+        model = self.transcription_model_combo.currentText().strip() or "未选择模型"
+
+        if requested == "auto":
+            self.transcription_resolution_label.setText(
+                f"自动选择当前解析为：{provider_name} · {model}"
+            )
+        else:
+            self.transcription_resolution_label.setText(
+                f"实际转写将使用：{provider_name} · {model}"
+            )
 
     def _choose_cookie(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -495,13 +815,17 @@ class SettingsDialog(QDialog):
             self.cookie_edit.setText(path)
 
     def values(self) -> dict[str, object]:
+        self._save_visible_transcription_model()
+        provider_id = str(self.provider_combo.currentData() or "gemini")
         return {
-            "api_key": self.api_edit.text().strip(),
-            "api_from_env": self._api_from_env,
+            "provider": provider_id,
+            "api_keys": {pid: edit.text().strip() for pid, edit in self._api_edits.items()},
+            "api_from_env": dict(self._api_from_env),
+            "provider_models": {pid: combo.currentText().strip() for pid, combo in self._model_combos.items()},
+            "transcription_provider": str(self.transcription_combo.currentData() or "auto"),
+            "transcription_models": dict(self._transcription_models),
             "cookie_file": self.cookie_edit.text().strip(),
-            "model": self.model_combo.currentText().strip(),
             "keep_download": self.keep_check.isChecked(),
-            "theme": str(self.theme_combo.currentData() or "light"),
         }
 
     def _apply_style(self, theme: str) -> None:
@@ -518,16 +842,53 @@ class SettingsDialog(QDialog):
             QDialog {{ background: {bg}; }}
             QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox {{ font-family: "{APP_FONT_FAMILY}"; }}
             QLabel#settingsTitle {{ color: {text}; font-size: 22px; font-weight: 800; }}
-            QLabel#settingsMuted, QLabel#settingsHint {{ color: {muted}; font-size: 10px; }}
+            QLabel#settingsMuted, QLabel#settingsHint, QLabel#settingsCacheHint {{
+                color: {muted}; font-size: 10px;
+            }}
             QFrame#settingsSection {{ background: {card}; border: 1px solid {border}; border-radius: 12px; }}
             QLabel#settingsSectionTitle {{ color: {text}; font-size: 13px; font-weight: 700; }}
             QLabel#settingsFieldLabel {{ color: {muted}; font-size: 10px; font-weight: 600; }}
-            QLineEdit, QComboBox {{ min-height: 38px; background: {input_bg}; color: {text}; border: 1px solid {border}; border-radius: 8px; padding: 0 10px; }}
-            QComboBox::drop-down {{ border: none; width: 26px; }}
-            QComboBox QAbstractItemView {{ background: {card}; color: {text}; border: 1px solid {border}; }}
+            QLineEdit, QComboBox {{
+                min-height: 40px; background: {input_bg}; color: {text};
+                border: 1px solid {border}; border-radius: 8px;
+            }}
+            QLineEdit {{ padding: 0 10px; }}
+            QComboBox {{ padding: 0 34px 0 10px; }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                border: none;
+                width: 32px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                width: 0;
+                height: 0;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {card}; color: {text};
+                selection-background-color: #4F7DF3; selection-color: white;
+                border: 1px solid {border}; outline: 0; padding: 3px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 30px;
+                padding: 4px 8px;
+            }}
+            QStackedWidget {{ background: transparent; border: none; }}
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollArea > QWidget > QWidget {{ background: transparent; }}
             QCheckBox {{ color: {text}; spacing: 8px; font-size: 11px; }}
             QPushButton {{ background: transparent; color: {text}; border: 1px solid {border}; border-radius: 8px; padding: 7px 13px; font-size: 11px; }}
             QPushButton:hover {{ background: {hover}; }}
+            QPushButton#settingsRefreshButton {{
+                background: transparent;
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 8px;
+                padding: 7px 10px;
+            }}
+            QPushButton#settingsRefreshButton:hover {{ background: {hover}; }}
+            QPushButton#settingsRefreshButton:disabled {{ color: {muted}; }}
             QPushButton#settingsPrimaryButton {{ background: #4F7DF3; color: white; border: none; }}
             QPushButton#settingsPrimaryButton:hover {{ background: #416FE4; }}
             '''

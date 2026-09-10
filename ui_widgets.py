@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPointF, Property, QPropertyAnimation, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QAbstractButton, QFrame, QHBoxLayout, QLabel, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtCore import QEasingCurve, QPoint, QPointF, Property, QPropertyAnimation, QRect, QRectF, QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PySide6.QtWidgets import QAbstractButton, QComboBox, QFrame, QHBoxLayout, QLabel, QProxyStyle, QSizePolicy, QStyle, QTextEdit, QVBoxLayout, QWidget
 
 SUPPORTED_MEDIA = (
     ".m4s", ".mp3", ".mp4", ".m4a", ".wav", ".aac", ".flac",
@@ -97,6 +97,189 @@ def make_icon(kind: str, color: str, active_color: str | None = None, size: int 
         QIcon.State.Off,
     )
     return icon
+
+class _ComboListPopupStyle(QProxyStyle):
+    """Force QComboBox to use a list-view popup instead of menu-like scrollers.
+
+    On Windows, SH_ComboBox_Popup can make Qt create the black
+    QComboBoxPrivateScroller bars at the top and bottom of long popups.
+    Returning 0 gives us a normal list popup with a standard vertical scrollbar.
+    """
+
+    def styleHint(
+        self,
+        hint,
+        option=None,
+        widget=None,
+        returnData=None,
+    ):  # noqa: N802
+        if hint == QStyle.StyleHint.SH_ComboBox_Popup:
+            return 0
+        return super().styleHint(
+            hint,
+            option,
+            widget,
+            returnData,
+        )
+
+
+class SmartComboBox(QComboBox):
+    """A non-editable combo box with a stable, bounded popup and custom chevron.
+
+    Qt/Windows may turn long non-editable combo popups into menu-like lists
+    with black auto-scroll strips at the top and bottom. This widget forces a
+    normal list-view popup instead, caps its height, uses a standard vertical
+    scrollbar, anchors it under the field whenever space permits, and draws
+    its own chevron so the drop-down affordance is always visible.
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        max_visible_items: int = 9,
+        max_popup_width: int = 460,
+    ):
+        super().__init__(parent)
+
+        # Disable Qt's menu-style QComboBoxPrivateScroller strips. Keep the
+        # style object alive on this combo for the lifetime of the widget.
+        self._popup_style = _ComboListPopupStyle(self.style())
+        self._popup_style.setParent(self)
+        self.setStyle(self._popup_style)
+
+        self._max_popup_items = max(3, int(max_visible_items))
+        self._max_popup_width = max(220, int(max_popup_width))
+
+        self.setEditable(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMaxVisibleItems(self._max_popup_items)
+
+        view = self.view()
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view.setTextElideMode(Qt.TextElideMode.ElideRight)
+
+        # Smooth item-by-item scrolling via wheel / side scrollbar only.
+        # No top/bottom auto-scroll strips are used.
+        view.setVerticalScrollMode(view.ScrollMode.ScrollPerPixel)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        # Let Qt/QSS draw the normal combo first.
+        super().paintEvent(event)
+
+        # Then draw a small chevron ourselves. This avoids relying on the
+        # platform's native combo arrow, which can disappear after QSS styling.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        color = self.palette().color(QPalette.ColorRole.Text)
+        color.setAlpha(190)
+
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        cx = float(self.width() - 17)
+        cy = float(self.height()) / 2.0 - 0.5
+        painter.drawLine(QPointF(cx - 4.0, cy - 2.0), QPointF(cx, cy + 2.0))
+        painter.drawLine(QPointF(cx, cy + 2.0), QPointF(cx + 4.0, cy - 2.0))
+        painter.end()
+
+    def showPopup(self) -> None:  # noqa: N802
+        if self.count() <= 0:
+            return
+
+        super().showPopup()
+
+        # Some styles resize/reposition the popup after showPopup() returns,
+        # therefore position once now and once again on the next event-loop turn.
+        self._position_popup()
+        QTimer.singleShot(0, self._position_popup)
+
+    def _position_popup(self) -> None:
+        view = self.view()
+        if view is None:
+            return
+
+        popup = view.window()
+        if popup is None or popup is self.window():
+            return
+
+        screen = self.screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+
+        # Use the real row height when available.
+        row_height = view.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = max(30, self.fontMetrics().height() + 12)
+
+        visible_rows = min(max(1, self.count()), self._max_popup_items)
+        desired_height = row_height * visible_rows + 6
+
+        # Width: at least the field width, wide enough for normal model names,
+        # but never absurdly wide on a small display.
+        metrics = self.fontMetrics()
+        longest = 0
+        for i in range(self.count()):
+            longest = max(longest, metrics.horizontalAdvance(self.itemText(i)))
+        desired_width = max(self.width(), longest + 46)
+        desired_width = min(
+            desired_width,
+            self._max_popup_width,
+            max(self.width(), available.width() - 24),
+        )
+
+        field_top = self.mapToGlobal(QPoint(0, 0))
+        field_bottom = self.mapToGlobal(QPoint(0, self.height()))
+
+        x = field_bottom.x()
+        y = field_bottom.y() + 2
+
+        margin = 8
+        min_height = min(
+            desired_height,
+            row_height * min(3, visible_rows) + 6,
+        )
+
+        # Keep the popup on-screen horizontally.
+        if x + desired_width > available.right() - margin + 1:
+            x = available.right() - desired_width - margin + 1
+        x = max(available.left() + margin, x)
+
+        space_below = available.bottom() - y - margin + 1
+
+        # Prefer placement directly below the field. Because the popup is now
+        # capped to a small number of rows, this is the normal path.
+        if space_below >= min_height:
+            desired_height = min(desired_height, space_below)
+        else:
+            # Only fall back above when there truly is not enough usable space.
+            space_above = field_top.y() - available.top() - margin
+            if space_above > space_below:
+                desired_height = min(desired_height, space_above)
+                y = field_top.y() - desired_height - 2
+            else:
+                desired_height = max(row_height + 6, space_below)
+
+        popup.setGeometry(
+            QRect(
+                int(x),
+                int(y),
+                int(desired_width),
+                int(max(row_height + 6, desired_height)),
+            )
+        )
+
+        # The item view itself should use the popup width and rely on the
+        # vertical scrollbar for long model lists.
+        view.setMinimumWidth(max(0, int(desired_width) - 2))
+        view.setMaximumHeight(max(row_height + 4, int(desired_height) - 2))
+
 
 class ToggleSwitch(QAbstractButton):
     def __init__(self, parent=None):
