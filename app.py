@@ -2,6 +2,35 @@ from __future__ import annotations
 
 import json
 import os
+def repair_ssl_environment() -> None:
+    """
+    修复指向不存在文件的 SSL_CERT_FILE。
+
+    某些 Conda 环境切换后可能遗留其他环境的证书路径，
+    导致 httpx / google-genai 初始化 SSL 时直接报 FileNotFoundError。
+    """
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+
+    if not ssl_cert:
+        return
+
+    if Path(ssl_cert).is_file():
+        return
+
+    try:
+        import certifi
+
+        certifi_path = certifi.where()
+
+        if Path(certifi_path).is_file():
+            os.environ["SSL_CERT_FILE"] = certifi_path
+            return
+    except Exception:
+        pass
+
+    # 如果无法取得 certifi，就删除失效变量，
+    # 让 Python SSL 使用自己的默认验证路径。
+    os.environ.pop("SSL_CERT_FILE", None)
 import tempfile
 import time
 from datetime import datetime
@@ -2777,6 +2806,9 @@ class MainWindow(QMainWindow):
 
 
 def run() -> None:
+    repair_ssl_environment()
+
+    app = QApplication.instance() or QApplication([])
     app = QApplication.instance() or QApplication([])
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)

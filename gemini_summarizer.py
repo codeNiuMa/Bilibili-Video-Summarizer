@@ -86,9 +86,12 @@ def summarize_audio(
     if not audio_path.is_file():
         raise GeminiError("待上传的音频文件不存在。")
 
-    client = genai.Client(api_key=api_key.strip())
+    client = None
     uploaded = None
+
     try:
+        client = genai.Client(api_key=api_key.strip())
+
         progress(55, "正在上传音频到 Gemini…")
         uploaded = client.files.upload(file=str(audio_path))
 
@@ -123,9 +126,8 @@ def summarize_audio(
     except Exception as exc:
         raise GeminiError(f"Gemini 调用失败：{exc}") from exc
     finally:
-        if uploaded is not None:
+        if client is not None and uploaded is not None:
             try:
                 client.files.delete(name=uploaded.name)
             except Exception:
-                # Cleanup failure should not hide a successful summary or the real error.
                 pass
