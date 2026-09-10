@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QSize, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -167,6 +169,7 @@ def make_icon(kind: str, color: str, active_color: str | None = None, size: int 
 
 class ProcessingThread(QThread):
     progress_changed = Signal(int, str)
+    media_info_ready = Signal(dict)
     result_ready = Signal(str)
     failed = Signal(str)
 
@@ -226,6 +229,23 @@ class ProcessingThread(QThread):
                         self._progress,
                         self._write_log,
                     )
+
+                # Extra UI metadata only; does not alter the stable processing flow.
+                try:
+                    source_path = Path(source) if self.url else Path(self.local_file)
+                    source_size = source_path.stat().st_size if source_path.is_file() else 0
+                    prepared_path = Path(audio)
+                    prepared_size = prepared_path.stat().st_size if prepared_path.is_file() else 0
+                    self.media_info_ready.emit(
+                        {
+                            "source_name": source_path.name,
+                            "source_bytes": int(source_size),
+                            "prepared_bytes": int(prepared_size),
+                        }
+                    )
+                except Exception:
+                    # UI metadata must never affect summarization.
+                    pass
 
                 result = summarize_audio(
                     audio_path=audio,
@@ -685,6 +705,30 @@ class MainWindow(QMainWindow):
         self.task_details_expanded = False
         self.focus_mode = False
 
+        # ==========================================
+        # Live processing feedback / Gemini activity
+        # ==========================================
+        self.activity_running = False
+        self.activity_stage = "idle"
+        self.activity_stage_started = 0.0
+        self.activity_task_started = 0.0
+        self.activity_inference_started = 0.0
+        self.activity_stage_durations: dict[str, float] = {}
+        self.activity_tick_count = 0
+        self.activity_pulse_bright = False
+        self.indeterminate_mode = False
+        self.indeterminate_phase = 0
+        self.activity_source_kind = "video"
+        self.activity_source_desc = ""
+        self.activity_model_desc = ""
+        self.activity_failed_stage: str | None = None
+        self.activity_media_info: dict[str, object] = {}
+        self.activity_panel_expanded = False
+
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(250)
+        self.activity_timer.timeout.connect(self._tick_activity)
+
         self._build_shell()
         self._build_sidebar()
         self._build_content()
@@ -805,6 +849,10 @@ class MainWindow(QMainWindow):
         self._position_resize_handles()
         if hasattr(self, "progress_track"):
             self._sync_progress_fill()
+        if getattr(self, "activity_panel_expanded", False):
+            self._position_activity_panel()
+        if hasattr(self, "activity_wait_track"):
+            self._sync_activity_wait_fill()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
@@ -1180,14 +1228,202 @@ class MainWindow(QMainWindow):
         bar_row.addWidget(self.progress_track, 1)
         self.percent_label = QLabel("0%", progress_card)
         self.percent_label.setObjectName("monoMuted")
-        self.percent_label.setFixedWidth(42)
+        self.percent_label.setFixedWidth(68)
         self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         bar_row.addWidget(self.percent_label)
         progress_layout.addLayout(bar_row)
 
+        # Main status line + optional detailed task-status dropdown.
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+
         self.progress_text = QLabel("就绪", progress_card)
         self.progress_text.setObjectName("mutedText")
-        progress_layout.addWidget(self.progress_text)
+        self.progress_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        status_row.addWidget(self.progress_text, 1)
+
+        self.activity_toggle_button = QPushButton("查看任务状态  ▾", progress_card)
+        self.activity_toggle_button.setObjectName("activityToggleButton")
+        self.activity_toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.activity_toggle_button.setFixedHeight(30)
+        self.activity_toggle_button.setToolTip("展开下载、音频处理、Gemini 上传与 AI 推理的详细状态")
+        self.activity_toggle_button.clicked.connect(self.toggle_activity_panel)
+        status_row.addWidget(self.activity_toggle_button)
+
+        progress_layout.addLayout(status_row)
+
+        # ==================================================
+        # On-demand task status panel
+        # Hidden by default; users expand it only when needed.
+        # ==================================================
+        # Floating on-demand telemetry popup.  It is intentionally NOT part of
+        # progress_layout, otherwise expanding it forces the whole page to
+        # compress vertically and the stage rows become crowded.
+        self.activity_panel = QFrame(self.main_panel)
+        self.activity_panel.setObjectName("aiActivityPanel")
+        self.activity_panel.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        self.activity_panel_shadow = QGraphicsDropShadowEffect(self.activity_panel)
+        self.activity_panel_shadow.setBlurRadius(30)
+        self.activity_panel_shadow.setOffset(0, 8)
+        self.activity_panel_shadow.setColor(QColor(0, 0, 0, 65))
+        self.activity_panel.setGraphicsEffect(self.activity_panel_shadow)
+
+        activity_layout = QVBoxLayout(self.activity_panel)
+        activity_layout.setContentsMargins(22, 20, 22, 18)
+        activity_layout.setSpacing(16)
+
+        # Header
+        activity_header = QHBoxLayout()
+        activity_header.setSpacing(9)
+
+        self.activity_pulse = QLabel("●", self.activity_panel)
+        self.activity_pulse.setObjectName("activityPulse")
+        self.activity_pulse.setFixedSize(18, 18)
+        self.activity_pulse.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+        activity_header.addWidget(self.activity_pulse)
+
+        self.activity_title = QLabel("任务状态", self.activity_panel)
+        self.activity_title.setObjectName("activityTitle")
+        activity_header.addWidget(self.activity_title)
+        activity_header.addStretch(1)
+
+        self.activity_elapsed_label = QLabel("总耗时 00:00", self.activity_panel)
+        self.activity_elapsed_label.setObjectName("activityElapsed")
+        self.activity_elapsed_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        activity_header.addWidget(self.activity_elapsed_label)
+
+        self.activity_close_button = QPushButton("收起", self.activity_panel)
+        self.activity_close_button.setObjectName("activityPanelCloseButton")
+        self.activity_close_button.setFixedHeight(28)
+        self.activity_close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.activity_close_button.clicked.connect(self.toggle_activity_panel)
+        activity_header.addWidget(self.activity_close_button)
+
+        activity_layout.addLayout(activity_header)
+
+        # Metadata summary: three balanced columns with dedicated label/value
+        # rows.  This uses horizontal space instead of consuming vertical space.
+        meta_grid = QGridLayout()
+        meta_grid.setContentsMargins(0, 2, 0, 2)
+        meta_grid.setHorizontalSpacing(24)
+        meta_grid.setVerticalSpacing(5)
+        for column in range(3):
+            meta_grid.setColumnStretch(column, 1)
+
+        model_key = QLabel("模型", self.activity_panel)
+        model_key.setObjectName("activityMetaKey")
+        self.activity_model_value = QLabel("—", self.activity_panel)
+        self.activity_model_value.setObjectName("activityMetaValue")
+        self.activity_model_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.activity_model_value.setMinimumHeight(24)
+
+        source_key = QLabel("来源", self.activity_panel)
+        source_key.setObjectName("activityMetaKey")
+        self.activity_source_value = QLabel("—", self.activity_panel)
+        self.activity_source_value.setObjectName("activityMetaValue")
+        self.activity_source_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.activity_source_value.setWordWrap(True)
+        self.activity_source_value.setMinimumHeight(24)
+
+        audio_key = QLabel("Gemini 音频", self.activity_panel)
+        audio_key.setObjectName("activityMetaKey")
+        self.activity_audio_value = QLabel("—", self.activity_panel)
+        self.activity_audio_value.setObjectName("activityMetaValue")
+        self.activity_audio_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.activity_audio_value.setMinimumHeight(24)
+
+        meta_grid.addWidget(model_key, 0, 0)
+        meta_grid.addWidget(source_key, 0, 1)
+        meta_grid.addWidget(audio_key, 0, 2)
+        meta_grid.addWidget(self.activity_model_value, 1, 0)
+        meta_grid.addWidget(self.activity_source_value, 1, 1)
+        meta_grid.addWidget(self.activity_audio_value, 1, 2)
+        activity_layout.addLayout(meta_grid)
+
+        section_title = QLabel("任务阶段", self.activity_panel)
+        section_title.setObjectName("activitySectionTitle")
+        activity_layout.addWidget(section_title)
+
+        stage_grid = QGridLayout()
+        stage_grid.setContentsMargins(0, 0, 0, 0)
+        stage_grid.setHorizontalSpacing(10)
+        stage_grid.setVerticalSpacing(7)
+        stage_grid.setColumnStretch(1, 1)
+
+        self.activity_stage_icon_labels = {}
+        self.activity_stage_name_labels = {}
+        self.activity_stage_time_labels = {}
+
+        stage_defs = [
+            ("source", "获取 B站音频"),
+            ("normalize", "音频预处理"),
+            ("upload", "上传 / 处理 Gemini 音频"),
+            ("inference", "AI 生成结构化摘要"),
+        ]
+
+        for row, (key, label_text) in enumerate(stage_defs):
+            icon_label = QLabel("○", self.activity_panel)
+            icon_label.setObjectName("activityStageIcon")
+            icon_label.setFixedWidth(18)
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            name_label = QLabel(label_text, self.activity_panel)
+            name_label.setObjectName("activityStageName")
+
+            time_label = QLabel("等待", self.activity_panel)
+            time_label.setObjectName("activityStageTime")
+            icon_label.setMinimumHeight(28)
+            name_label.setMinimumHeight(28)
+            time_label.setMinimumWidth(88)
+            time_label.setMinimumHeight(28)
+            time_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            self.activity_stage_icon_labels[key] = icon_label
+            self.activity_stage_name_labels[key] = name_label
+            self.activity_stage_time_labels[key] = time_label
+
+            stage_grid.addWidget(icon_label, row, 0)
+            stage_grid.addWidget(name_label, row, 1)
+            stage_grid.addWidget(time_label, row, 2)
+            stage_grid.setRowMinimumHeight(row, 30)
+
+        activity_layout.addLayout(stage_grid)
+
+        self.activity_wait_track = QFrame(self.activity_panel)
+        self.activity_wait_track.setObjectName("activityWaitTrack")
+        self.activity_wait_track.setFixedHeight(5)
+
+        self.activity_wait_fill = QFrame(self.activity_wait_track)
+        self.activity_wait_fill.setObjectName("activityWaitFill")
+        self.activity_wait_fill.setGeometry(0, 0, 0, 5)
+        activity_layout.addWidget(self.activity_wait_track)
+
+        self.activity_hint_label = QLabel(
+            "详细状态会持续更新；收起此面板不会影响任务运行。",
+            self.activity_panel,
+        )
+        self.activity_hint_label.setObjectName("activityHint")
+        self.activity_hint_label.setWordWrap(True)
+        self.activity_hint_label.setMinimumHeight(34)
+        activity_layout.addWidget(self.activity_hint_label)
+
+        # Popup is positioned manually over the main panel, so opening it does
+        # not resize input/progress/result cards.
+        self.activity_panel.hide()
+
         main.addWidget(progress_card)
 
         self.result_card = QFrame(self.main_panel)
@@ -1353,21 +1589,21 @@ class MainWindow(QMainWindow):
                 border: 1px solid {border};
                 border-radius: 11px;
             }}
-            
+
             QPushButton#compactToggleButton {{
                 background: transparent;
                 color: {text};
                 border: none;
-            
+
                 padding: 0;
-            
+
                 text-align: left;
-            
+
                 font-family: "Microsoft YaHei UI";
                 font-size: 12px;
                 font-weight: 650;
             }}
-            
+
             QPushButton#compactToggleButton:hover {{
                 color: {accent};
             }}
@@ -1408,14 +1644,14 @@ class MainWindow(QMainWindow):
                 color: {text};
                 border: none;
                 border-radius: 9px;
-            
+
                 text-align: left;
-            
+
                 padding-top: 10px;
                 padding-bottom: 10px;
                 padding-left: 12px;
                 padding-right: 10px;
-            
+
                 font-size: 12px;
             }}
             QPushButton#sidebarAction:hover {{ background: {hover}; }}
@@ -1430,6 +1666,118 @@ class MainWindow(QMainWindow):
             QPushButton#windowButtonClose:hover {{ background: #C42B1C; }}
             QFrame#progressTrack {{ background: {soft}; border: none; border-radius: 3px; }}
             QFrame#progressFill {{ background: {accent}; border: none; border-radius: 3px; }}
+
+            QPushButton#activityToggleButton {{
+                background: transparent;
+                color: {muted};
+                border: none;
+                border-radius: 7px;
+                padding: 4px 8px;
+                font-size: 10px;
+                font-weight: 600;
+            }}
+            QPushButton#activityToggleButton:hover {{
+                color: {accent};
+                background: {hover};
+            }}
+
+            QFrame#aiActivityPanel {{
+                background: {card};
+                border: 1px solid {border};
+                border-radius: 14px;
+            }}
+            QPushButton#activityPanelCloseButton {{
+                background: transparent;
+                color: {muted};
+                border: 1px solid {border};
+                border-radius: 7px;
+                padding: 3px 10px;
+                font-size: 10px;
+                font-weight: 600;
+            }}
+            QPushButton#activityPanelCloseButton:hover {{
+                color: {accent};
+                background: {hover};
+            }}
+            QLabel#activityPulse {{
+                color: {muted};
+                border: none;
+                font-size: 11px;
+                min-width: 18px;
+                max-width: 18px;
+                min-height: 18px;
+                max-height: 18px;
+            }}
+            QLabel#activityPulse[bright="true"] {{
+                color: {accent};
+                font-size: 15px;
+            }}
+            QLabel#activityTitle {{
+                color: {text};
+                border: none;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QLabel#activityElapsed {{
+                color: {muted};
+                border: none;
+                font-family: Consolas;
+                font-size: 10px;
+            }}
+            QLabel#activityMetaKey {{
+                color: {muted};
+                border: none;
+                font-size: 10px;
+                font-weight: 600;
+            }}
+            QLabel#activityMetaValue {{
+                color: {text};
+                border: none;
+                font-size: 11px;
+                font-weight: 600;
+            }}
+            QLabel#activitySectionTitle {{
+                color: {muted};
+                border: none;
+                font-size: 10px;
+                font-weight: 700;
+                padding-top: 2px;
+            }}
+            QLabel#activityStageIcon {{
+                color: {accent};
+                border: none;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QLabel#activityStageName {{
+                color: {text};
+                border: none;
+                font-size: 11px;
+                font-weight: 550;
+            }}
+            QLabel#activityStageTime {{
+                color: {muted};
+                border: none;
+                font-family: Consolas;
+                font-size: 10px;
+            }}
+            QLabel#activityHint {{
+                color: {muted};
+                border: none;
+                font-size: 10px;
+                padding-top: 1px;
+            }}
+            QFrame#activityWaitTrack {{
+                background: {border};
+                border: none;
+                border-radius: 2px;
+            }}
+            QFrame#activityWaitFill {{
+                background: {accent};
+                border: none;
+                border-radius: 2px;
+            }}
+
             QTextBrowser#resultBrowser {{
                 background: {result_bg}; color: {text}; border: none; border-radius: 10px;
                 padding: 9px; font-family: "Microsoft YaHei UI"; font-size: 13px;
@@ -1648,6 +1996,11 @@ class MainWindow(QMainWindow):
         self.result_mode = True
         self.task_details_expanded = False
 
+        if getattr(self, "activity_panel_expanded", False):
+            self.activity_panel_expanded = False
+            self.activity_panel.hide()
+            self.activity_toggle_button.setText("查看任务状态  ▾")
+
         self.input_card.hide()
         self.progress_card.hide()
 
@@ -1712,6 +2065,11 @@ class MainWindow(QMainWindow):
 
         else:
 
+            if getattr(self, "activity_panel_expanded", False):
+                self.activity_panel_expanded = False
+                self.activity_panel.hide()
+                self.activity_toggle_button.setText("查看任务状态  ▾")
+
             self.input_card.hide()
             self.progress_card.hide()
 
@@ -1734,6 +2092,11 @@ class MainWindow(QMainWindow):
             return
 
         self.focus_mode = True
+
+        if getattr(self, "activity_panel_expanded", False):
+            self.activity_panel_expanded = False
+            self.activity_panel.hide()
+            self.activity_toggle_button.setText("查看任务状态  ▾")
 
         # 左侧栏完全隐藏
         self.sidebar.hide()
@@ -1850,6 +2213,8 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.start_button.setText("处理中…")
+
+        self._start_activity(url=url, local_file=local)
         self._apply_progress(0, "准备任务…")
 
         self.latest_log.parent.mkdir(parents=True, exist_ok=True)
@@ -1870,25 +2235,448 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.processing_thread.progress_changed.connect(self._apply_progress)
+        self.processing_thread.media_info_ready.connect(self._apply_media_info)
         self.processing_thread.result_ready.connect(self._show_result)
         self.processing_thread.failed.connect(self._show_error)
         self.processing_thread.finished.connect(self._finish_processing)
         self.processing_thread.finished.connect(self.processing_thread.deleteLater)
         self.processing_thread.start()
 
+    # ------------------------------------------------------------------
+    # Rich live processing feedback
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_clock(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        minutes, sec = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+        return f"{minutes:02d}:{sec:02d}"
+
+    @staticmethod
+    def _format_stage_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, sec = divmod(int(seconds), 60)
+        if minutes < 60:
+            return f"{minutes}:{sec:02d}"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{sec:02d}"
+
+    @staticmethod
+    def _format_bytes(size: int) -> str:
+        size = max(0, int(size))
+        units = ["B", "KB", "MB", "GB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{size} B"
+
+    def _start_activity(self, *, url: str, local_file: str) -> None:
+        now = time.monotonic()
+
+        self.activity_running = True
+        self.activity_stage = "source"
+        self.activity_stage_started = now
+        self.activity_task_started = now
+        self.activity_inference_started = 0.0
+        self.activity_stage_durations = {}
+        self.activity_tick_count = 0
+        self.activity_pulse_bright = False
+        self.indeterminate_mode = False
+        self.indeterminate_phase = 0
+        self.activity_media_info = {}
+        self.activity_failed_stage = None
+        self.activity_model_desc = str(self.settings.model or "").strip() or "Gemini"
+
+        if url:
+            self.activity_source_kind = "bilibili"
+            self.activity_source_desc = "B站视频链接"
+        else:
+            self.activity_source_kind = "local"
+            file_path = Path(local_file)
+            name = file_path.name or "本地媒体"
+            if len(name) > 42:
+                name = name[:19] + "…" + name[-19:]
+            try:
+                size = self._format_bytes(file_path.stat().st_size)
+                self.activity_source_desc = f"{name} · {size}"
+            except OSError:
+                self.activity_source_desc = name
+
+        self.activity_title.setText("任务处理中")
+        self.activity_elapsed_label.setText("总耗时 00:00")
+        self.activity_hint_label.setText("正在准备媒体，请稍候…")
+        self.activity_panel_expanded = False
+        self.activity_panel.hide()
+        self.activity_toggle_button.setText("查看任务状态  ▾")
+        self._refresh_activity_info()
+        self._render_activity_timeline(now)
+
+        self.activity_pulse.setProperty("bright", False)
+        self.activity_pulse.style().unpolish(self.activity_pulse)
+        self.activity_pulse.style().polish(self.activity_pulse)
+
+        self.activity_timer.start()
+
+    def _stage_from_progress(self, percent: int, text: str) -> str:
+        if percent >= 100 or "总结完成" in text:
+            return "complete"
+        if percent >= 72 or ("正在总结视频" in text and "完成" not in text):
+            return "inference"
+        if percent >= 55 or "Gemini" in text:
+            return "upload"
+        if percent >= 38:
+            return "normalize"
+        return "source"
+
+    def _transition_activity(self, new_stage: str) -> None:
+        if not self.activity_running:
+            return
+
+        now = time.monotonic()
+        old_stage = self.activity_stage
+
+        if new_stage == old_stage:
+            return
+
+        if old_stage in {"source", "normalize", "upload", "inference"}:
+            elapsed = max(0.0, now - self.activity_stage_started)
+            self.activity_stage_durations[old_stage] = (
+                    self.activity_stage_durations.get(old_stage, 0.0) + elapsed
+            )
+
+        self.activity_stage = new_stage
+        self.activity_stage_started = now
+
+        if new_stage == "upload":
+            self.activity_title.setText("Gemini 正在准备音频")
+            self.activity_hint_label.setText(
+                "音频正在上传或由 Gemini Files API 处理，完成后会自动进入模型分析。"
+            )
+
+        elif new_stage == "inference":
+            self.activity_inference_started = now
+            self.indeterminate_mode = True
+            self.indeterminate_phase = 0
+            self.activity_title.setText("Gemini 正在生成视频笔记")
+            self.activity_hint_label.setText(
+                "已向模型提交完整音频，正在等待 Gemini 返回总结。程序仍在正常运行。"
+            )
+
+        elif new_stage == "complete":
+            self._complete_activity(success=True)
+            return
+
+        self._render_activity_timeline(now)
+
+    def _complete_activity(self, *, success: bool) -> None:
+        now = time.monotonic()
+
+        if self.activity_running and self.activity_stage in {
+            "source",
+            "normalize",
+            "upload",
+            "inference",
+        }:
+            elapsed = max(0.0, now - self.activity_stage_started)
+            self.activity_stage_durations[self.activity_stage] = (
+                    self.activity_stage_durations.get(self.activity_stage, 0.0) + elapsed
+            )
+
+        self.activity_running = False
+        self.indeterminate_mode = False
+        self.activity_timer.stop()
+
+        total = (
+            max(0.0, now - self.activity_task_started)
+            if self.activity_task_started
+            else 0.0
+        )
+
+        if success:
+            self.activity_failed_stage = None
+            self.activity_stage = "complete"
+            self.activity_title.setText("处理完成")
+            self.activity_hint_label.setText(
+                f"全部阶段已完成 · 总耗时 {self._format_clock(total)}"
+            )
+            self.activity_pulse.setProperty("bright", True)
+            self.activity_wait_fill.setGeometry(
+                0,
+                0,
+                max(0, self.activity_wait_track.width()),
+                self.activity_wait_track.height(),
+            )
+        else:
+            self.activity_failed_stage = self.activity_stage
+            self.activity_stage = "failed"
+            self.activity_title.setText("任务已中断")
+            self.activity_hint_label.setText(
+                "任务没有正常完成。请查看上方错误信息或下载日志。"
+            )
+            self.activity_pulse.setProperty("bright", False)
+
+        self.activity_pulse.style().unpolish(self.activity_pulse)
+        self.activity_pulse.style().polish(self.activity_pulse)
+        self.activity_elapsed_label.setText(
+            f"总耗时 {self._format_clock(total)}"
+        )
+        self._render_activity_timeline(now)
+
+    def _apply_media_info(self, info: dict) -> None:
+        self.activity_media_info = dict(info or {})
+        self._refresh_activity_info()
+
+    def _refresh_activity_info(self) -> None:
+        model = self.activity_model_desc or str(self.settings.model or "").strip() or "Gemini"
+        source = self.activity_source_desc or "等待输入"
+
+        prepared_bytes = int(self.activity_media_info.get("prepared_bytes", 0) or 0)
+        source_bytes = int(self.activity_media_info.get("source_bytes", 0) or 0)
+
+        if prepared_bytes:
+            audio_text = self._format_bytes(prepared_bytes)
+        elif source_bytes:
+            audio_text = f"待转换 · 输入 {self._format_bytes(source_bytes)}"
+        else:
+            audio_text = "等待音频准备"
+
+        self.activity_model_value.setText(model)
+        self.activity_source_value.setText(source)
+        self.activity_audio_value.setText(audio_text)
+
+    def _current_stage_elapsed(self, stage: str, now: float) -> float:
+        value = float(self.activity_stage_durations.get(stage, 0.0))
+        if self.activity_running and self.activity_stage == stage:
+            value += max(0.0, now - self.activity_stage_started)
+        return value
+
+    def _render_activity_timeline(self, now: float | None = None) -> None:
+        if not hasattr(self, "activity_stage_icon_labels"):
+            return
+
+        now = time.monotonic() if now is None else now
+
+        source_name = (
+            "获取 B站音频"
+            if self.activity_source_kind == "bilibili"
+            else "读取本地媒体"
+        )
+        self.activity_stage_name_labels["source"].setText(source_name)
+
+        stages = [
+            ("source", source_name),
+            ("normalize", "音频预处理"),
+            ("upload", "上传 / 处理 Gemini 音频"),
+            ("inference", "AI 生成结构化摘要"),
+        ]
+
+        order = ["source", "normalize", "upload", "inference"]
+        current_index = (
+            order.index(self.activity_stage)
+            if self.activity_stage in order
+            else len(order)
+        )
+
+        for index, (key, _label) in enumerate(stages):
+            duration = self._current_stage_elapsed(key, now)
+
+            if key == self.activity_failed_stage:
+                icon = "×"
+                timing = self._format_stage_duration(duration)
+            elif key in self.activity_stage_durations:
+                icon = "✓"
+                timing = self._format_stage_duration(duration)
+            elif self.activity_running and self.activity_stage == key:
+                icon = "●"
+                timing = self._format_clock(duration)
+            elif self.activity_stage == "complete":
+                icon = "✓"
+                timing = self._format_stage_duration(duration)
+            elif index < current_index:
+                icon = "✓"
+                timing = self._format_stage_duration(duration)
+            else:
+                icon = "○"
+                timing = "等待"
+
+            self.activity_stage_icon_labels[key].setText(icon)
+            self.activity_stage_time_labels[key].setText(timing)
+
+    def _position_activity_panel(self) -> None:
+        """Place the floating task-status card under the dropdown trigger.
+
+        The panel deliberately overlays the page instead of participating in
+        the main QVBoxLayout; therefore opening it can never squeeze the stage
+        rows or the result area.
+        """
+        if not hasattr(self, "activity_panel"):
+            return
+
+        margin = 24
+        gap = 8
+        available_width = max(360, self.main_panel.width() - margin * 2)
+        width = min(760, available_width)
+        height = min(410, max(350, self.main_panel.height() - 110))
+
+        anchor = self.activity_toggle_button.mapTo(
+            self.main_panel,
+            self.activity_toggle_button.rect().bottomRight(),
+        )
+
+        x = anchor.x() - width
+        x = max(margin, min(x, self.main_panel.width() - margin - width))
+
+        y = anchor.y() + gap
+        bottom_limit = self.main_panel.height() - margin
+        if y + height > bottom_limit:
+            y = max(48, bottom_limit - height)
+
+        self.activity_panel.setGeometry(x, y, width, height)
+
+    def toggle_activity_panel(self) -> None:
+        """Show/hide detailed task telemetry without affecting the running job."""
+        self.activity_panel_expanded = not self.activity_panel_expanded
+
+        if self.activity_panel_expanded:
+            self._refresh_activity_info()
+            self._render_activity_timeline()
+            self._position_activity_panel()
+            self.activity_panel.show()
+            self.activity_panel.raise_()
+            self.activity_toggle_button.setText("收起任务状态  ▴")
+            self._sync_activity_wait_fill()
+        else:
+            self.activity_panel.hide()
+            self.activity_toggle_button.setText("查看任务状态  ▾")
+
+    def _activity_hint_for_wait(self, seconds: float) -> str:
+        if seconds < 10:
+            return "Gemini 已接收生成请求，正在准备响应…"
+        if seconds < 30:
+            return "正在等待 Gemini 返回完整总结。程序仍在正常运行，请稍候…"
+        if seconds < 60:
+            return "长视频分析通常需要更多时间；当前请求仍在处理中。"
+        if seconds < 120:
+            return (
+                "已等待较长时间。模型负载和网络状况可能影响响应速度，"
+                "请保持程序开启。"
+            )
+        return (
+            "Gemini 请求仍在等待响应。若服务最终返回超时或错误，"
+            "程序会明确提示；当前无需重复点击。"
+        )
+
+    def _tick_activity(self) -> None:
+        if not self.activity_running:
+            return
+
+        now = time.monotonic()
+        self.activity_tick_count += 1
+
+        total = max(0.0, now - self.activity_task_started)
+        self.activity_elapsed_label.setText(
+            f"总耗时 {self._format_clock(total)}"
+        )
+
+        # Gentle breathing dot: two states, updated only twice per second.
+        if self.activity_tick_count % 2 == 0:
+            self.activity_pulse_bright = not self.activity_pulse_bright
+            self.activity_pulse.setProperty(
+                "bright",
+                self.activity_pulse_bright,
+            )
+            self.activity_pulse.style().unpolish(self.activity_pulse)
+            self.activity_pulse.style().polish(self.activity_pulse)
+
+        if self.activity_stage == "inference":
+            wait = max(0.0, now - self.activity_inference_started)
+            self.activity_hint_label.setText(
+                f"AI 已等待 {self._format_clock(wait)} · "
+                f"{self._activity_hint_for_wait(wait)}"
+            )
+
+            # Indeterminate movement: deliberately does not invent a fake percentage.
+            self.indeterminate_phase = (self.indeterminate_phase + 12) % 200
+            self._sync_progress_fill()
+            self._sync_activity_wait_fill()
+
+        elif self.activity_stage == "upload":
+            self.activity_hint_label.setText(
+                "Gemini 正在接收或处理上传音频；这一阶段完成后会自动进入 AI 分析。"
+            )
+            self._sync_activity_wait_fill()
+
+        self._render_activity_timeline(now)
+
+    def _sync_activity_wait_fill(self) -> None:
+        if not hasattr(self, "activity_wait_track"):
+            return
+
+        width = max(0, self.activity_wait_track.width())
+        height = max(1, self.activity_wait_track.height())
+
+        if self.indeterminate_mode:
+            segment = max(40, int(width * 0.24))
+            travel = max(0, width - segment)
+            phase = self.indeterminate_phase
+            ratio = phase / 100 if phase <= 100 else (200 - phase) / 100
+            x = int(travel * ratio)
+            self.activity_wait_fill.setGeometry(x, 0, segment, height)
+        else:
+            self.activity_wait_fill.setGeometry(
+                0,
+                0,
+                int(width * self.current_progress / 100),
+                height,
+            )
+
     def _apply_progress(self, percent: int, text: str) -> None:
         percent = max(0, min(100, int(percent)))
+
+        stage = self._stage_from_progress(percent, text)
+        self._transition_activity(stage)
+
         self.current_progress = percent
+
+        if self.indeterminate_mode and stage == "inference":
+            self.percent_label.setText("AI 处理中")
+        else:
+            self.percent_label.setText(f"{percent}%")
+
         self._sync_progress_fill()
-        self.percent_label.setText(f"{percent}%")
+        self._sync_activity_wait_fill()
+
         self.progress_text.setText(text)
         self._set_status(text)
 
     def _sync_progress_fill(self) -> None:
         if not hasattr(self, "progress_track"):
             return
+
         width = max(0, self.progress_track.width())
-        self.progress_fill.setGeometry(0, 0, int(width * self.current_progress / 100), 7)
+        height = 7
+
+        if self.indeterminate_mode:
+            segment = max(48, int(width * 0.22))
+            travel = max(0, width - segment)
+            phase = self.indeterminate_phase
+            ratio = phase / 100 if phase <= 100 else (200 - phase) / 100
+            x = int(travel * ratio)
+            self.progress_fill.setGeometry(x, 0, segment, height)
+        else:
+            self.progress_fill.setGeometry(
+                0,
+                0,
+                int(width * self.current_progress / 100),
+                height,
+            )
 
     def _show_result(self, result: str) -> None:
         self.result_markdown = result
@@ -1913,6 +2701,7 @@ class MainWindow(QMainWindow):
         self.enter_result_mode()
 
     def _show_error(self, message: str) -> None:
+        self._complete_activity(success=False)
         self._set_status("处理失败", error=True)
         self.progress_text.setText("处理失败")
         self.result_browser.setPlainText(
